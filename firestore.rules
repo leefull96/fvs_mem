@@ -1,0 +1,40 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function myDoc() { return get(/databases/$(db)/documents/users/$(request.auth.uid)).data; }
+    function isActive() {
+      return signedIn()
+        && exists(/databases/$(db)/documents/users/$(request.auth.uid))
+        && myDoc().active == true;
+    }
+    function isAdmin() { return isActive() && myDoc().role == 'admin'; }
+    function isOwner() { return isActive() && resource.data.ownerUid == request.auth.uid; }
+
+    // 사원 정보: 본인 것은 읽기 가능, 목록/생성/수정은 관리자만
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // 회원(계약) 정보: 사원은 본인 건만, 관리자는 전체
+    match /contracts/{id} {
+      allow read: if isAdmin() || isOwner();
+      allow create: if isActive() && request.resource.data.ownerUid == request.auth.uid;
+      allow update: if (isAdmin() || isOwner())
+                    && request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if isAdmin() || isOwner();
+    }
+
+    // 일별 콜량/콜시간: 문서 ID = 사원UID_날짜
+    match /daily/{id} {
+      allow read: if isAdmin() || isOwner();
+      allow create: if isActive() && request.resource.data.ownerUid == request.auth.uid;
+      allow update: if isOwner() && request.resource.data.ownerUid == request.auth.uid;
+      allow delete: if false;
+    }
+  }
+}

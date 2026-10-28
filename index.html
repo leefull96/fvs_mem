@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>영업 회원 관리</title>
+<style>
+:root{--bg:#f4f6fa;--card:#fff;--text:#1d2433;--sub:#667085;--line:#e3e7ee;--pri:#2457d6;--pri-d:#1b44a8;--red:#d92d20;--green:#12805c;--warn:#b54708}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,"Malgun Gothic","Apple SD Gothic Neo",sans-serif}
+.hidden{display:none!important}
+button{font:inherit;cursor:pointer}
+input,select,textarea{font:inherit;width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--text)}
+textarea{resize:vertical;min-height:70px}
+label{display:block;font-size:13px;color:var(--sub);margin:0 0 4px}
+.btn{border:0;border-radius:8px;padding:9px 14px;background:var(--pri);color:#fff;font-weight:600}
+.btn:hover{background:var(--pri-d)}
+.btn.ghost{background:#fff;color:var(--text);border:1px solid var(--line)}
+.btn.ghost:hover{background:#f0f2f6}
+.btn.danger{background:var(--red)}
+.btn.sm{padding:5px 9px;font-size:13px}
+/* login */
+#login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+.login-box{background:var(--card);width:100%;max-width:360px;padding:28px;border-radius:14px;box-shadow:0 6px 24px rgba(20,30,60,.08)}
+.login-box h1{margin:0 0 4px;font-size:21px}
+.login-box p{margin:0 0 18px;color:var(--sub);font-size:13px}
+.login-box .f{margin-bottom:12px}
+.err{color:var(--red);font-size:13px;min-height:18px;margin:6px 0}
+/* app */
+header{background:var(--card);border-bottom:1px solid var(--line);padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+header h1{font-size:17px;margin:0;flex:1}
+header .who{color:var(--sub);font-size:13px}
+nav{display:flex;gap:4px;padding:10px 16px 0;max-width:1200px;margin:0 auto}
+nav button{border:0;background:transparent;padding:9px 14px;border-radius:8px 8px 0 0;color:var(--sub);font-weight:600}
+nav button.on{background:var(--card);color:var(--pri)}
+main{max-width:1200px;margin:0 auto;padding:0 16px 40px}
+.card{background:var(--card);border-radius:0 12px 12px 12px;padding:16px;box-shadow:0 1px 3px rgba(20,30,60,.05);margin-bottom:14px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}
+.bar>div{min-width:130px}
+.bar .grow{flex:1;min-width:160px}
+.tblwrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px;white-space:nowrap}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left}
+th{background:#f8f9fc;color:var(--sub);font-weight:600;font-size:13px;position:sticky;top:0}
+td.n,th.n{text-align:right}
+tbody tr.click{cursor:pointer}
+tbody tr.click:hover{background:#f6f8ff}
+tfoot td{font-weight:700;background:#f8f9fc}
+.tag{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;background:#eef2ff;color:var(--pri)}
+.tag.off{background:#fef3f2;color:var(--red)}
+.tag.ok{background:#ecfdf3;color:var(--green)}
+.muted{color:var(--sub);font-size:13px}
+.sum{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.sum div{background:#f8f9fc;border-radius:10px;padding:8px 14px}
+.sum b{display:block;font-size:17px}
+/* modal */
+.modal{position:fixed;inset:0;background:rgba(15,20,35,.45);display:flex;align-items:flex-start;justify-content:center;padding:20px 12px;overflow:auto;z-index:20}
+.modal .box{background:#fff;border-radius:14px;width:100%;max-width:640px;padding:20px}
+.modal h2{margin:0 0 14px;font-size:18px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.grid .full{grid-column:1/-1}
+.chk{display:flex;gap:12px;flex-wrap:wrap}
+.chk label{display:flex;align-items:center;gap:5px;margin:0;color:var(--text);font-size:14px}
+.chk input{width:auto}
+.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+.actions .left{margin-right:auto}
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1d2433;color:#fff;padding:10px 18px;border-radius:10px;z-index:30;font-size:14px}
+@media(max-width:560px){.grid{grid-template-columns:1fr}header h1{flex-basis:100%}}
+</style>
+</head>
+<body>
+
+<section id="login">
+  <form class="login-box" id="loginForm">
+    <h1>영업 회원 관리</h1>
+    <p>발급받은 아이디로 로그인하세요.</p>
+    <div class="f"><label>아이디</label><input id="lid" autocomplete="username" autocapitalize="none" required></div>
+    <div class="f"><label>비밀번호</label><input id="lpw" type="password" autocomplete="current-password" required></div>
+    <div class="err" id="lerr"></div>
+    <button class="btn" style="width:100%">로그인</button>
+  </form>
+</section>
+
+<section id="app" class="hidden">
+  <header>
+    <h1>영업 회원 관리</h1>
+    <span class="who" id="who"></span>
+    <button class="btn ghost sm" id="btnPw">비밀번호 변경</button>
+    <button class="btn ghost sm" id="btnOut">로그아웃</button>
+  </header>
+  <nav id="tabs"></nav>
+  <main id="view"></main>
+</section>
+
+<div id="modalRoot"></div>
+<div id="toast" class="hidden"></div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
