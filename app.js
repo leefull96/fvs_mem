@@ -5,9 +5,9 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
   getFirestore, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
-  collection, query, where, getDocs, serverTimestamp, writeBatch
+  collection, query, where, getDocs, serverTimestamp, writeBatch, deleteField
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { firebaseConfig, EMAIL_DOMAIN, OPTIONS } from "./firebase-config.js";
+import { firebaseConfig, EMAIL_DOMAIN, OPTIONS, DEFAULT_DB } from "./firebase-config.js";
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -20,8 +20,10 @@ const pad = n => String(n).padStart(2, "0");
 const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
 const won = n => (Number(n) || 0).toLocaleString("ko-KR");
 const toNum = v => Number(String(v ?? "").replace(/[^0-9.-]/g, "")) || 0;
+const digits = v => String(v ?? "").replace(/\D/g, "");
+const nk = s => String(s ?? "").replace(/\s/g, "").toLowerCase();
 const fmtPhone = v => {
-  const d = String(v).replace(/\D/g, "");
+  const d = digits(v);
   if (d.length === 11) return `${d.slice(0, 3)}-${d.slice(3, 7)}-${d.slice(7)}`;
   if (d.length === 10) return `${d.slice(0, 3)}-${d.slice(3, 6)}-${d.slice(6)}`;
   return v;
@@ -29,7 +31,7 @@ const fmtPhone = v => {
 const emailOf = id => `${id.trim().toLowerCase()}@${EMAIL_DOMAIN}`;
 function toast(msg) {
   const t = $("#toast"); t.textContent = msg; t.classList.remove("hidden");
-  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.add("hidden"), 2600);
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.add("hidden"), 3200);
 }
 const authMsg = e => ({
   "auth/invalid-credential": "아이디 또는 비밀번호가 올바르지 않습니다.",
@@ -40,16 +42,59 @@ const authMsg = e => ({
   "auth/weak-password": "비밀번호는 6자 이상이어야 합니다.",
   "auth/network-request-failed": "네트워크 오류입니다."
 }[e.code] || `오류: ${e.code || e.message}`);
+function closeModal() { $("#modalRoot").innerHTML = ""; }
 
 /* ---------- 상태 ---------- */
-let me = null;                 // {uid, name, role, loginId}
+let me = null;                 // {uid, name, role, loginId}  role: super | admin | sales
 let tab = "list";
 let ym = todayStr().slice(0, 7);
 let filterUid = "";            // 관리자 사원 필터
+let callUid = "";              // 일별 콜량 탭에서 관리자가 고른 사원
 let search = "";
-let contracts = [], dailies = [], users = [];
-const isAdmin = () => me?.role === "admin";
-const nameOf = uid => users.find(u => u.uid === uid)?.name || (uid === me?.uid ? me.name : "(알수없음)");
+let contracts = [], dailies = [], users = [], pendings = [], transfers = [];
+const selected = new Set();    // 관리자 목록에서 체크한 회원 id
+const PEND = "pending:";       // 아직 계정이 없는 담당자의 ownerUid 접두어
+const pendId = n => n.replace(/[\/\s]+/g, "_");
+let settings = { realtime: [...DEFAULT_DB.realtime], old: [...DEFAULT_DB.old] };
+
+const isSuper = () => me?.role === "super";
+const isAdmin = () => me?.role === "admin" || me?.role === "super";
+const roleLabel = r => ({ super: "슈퍼 관리자", admin: "일반 관리자", sales: "영업사원" }[r] || r);
+const nameOf = uid => String(uid || "").startsWith(PEND) ? `${uid.slice(PEND.length)} (미가입)`
+  : users.find(u => u.uid === uid)?.name || (uid === me?.uid ? me.name : "(알수없음)");
+const ownerOptions = sel => users.map(u => `<option value="${u.uid}" ${u.uid === sel ? "selected" : ""}>${esc(u.name)}</option>`).join("")
+  + pendings.map(p => `<option value="${PEND}${esc(p.name)}" ${PEND + p.name === sel ? "selected" : ""}>${esc(p.name)} (미가입)</option>`).join("");
+
+/* 금액·분류 */
+const amt = c => Number(c.amount) || 0;
+const isRefund = c => amt(c) < 0;
+const isUpsell = c => c.contractType === "업셀";
+
+/* ---------- DB 출처 (실시간 / 구디비) ---------- */
+const allSources = () => [...new Set([...settings.realtime, ...settings.old])];
+const srcTags = n => [settings.realtime.includes(n) ? "실시간" : null, settings.old.includes(n) ? "구디비" : null].filter(Boolean);
+function dbOptions(sel) {
+  const list = allSources(); if (sel && !list.includes(sel)) list.push(sel);
+  return `<option value=""></option>` + list.map(s => {
+    const t = srcTags(s);
+    return `<option value="${esc(s)}" ${s === sel ? "selected" : ""}>${esc(s)} (${t.length ? t.join("/") : "미등록"})</option>`;
+  }).join("");
+}
+// 상태와 DB 출처가 맞지 않으면 안내 문구를 돌려준다. 맞으면 "".
+function checkSource(status, src) {
+  if (!status || !src) return "";
+  if (status === "실시간" && !settings.realtime.includes(src))
+    return `⚠ 잘못 기입하신 것 같습니다.\n\n상태가 '실시간'이면 DB 출처는 [${settings.realtime.join(", ")}] 중에서만 선택할 수 있습니다.\n'${src}'은(는) 실시간 DB 출처가 아닙니다.`;
+  if (status === "구디비" && !settings.old.includes(src))
+    return `⚠ 잘못 기입하신 것 같습니다.\n\n상태가 '구디비'이면 DB 출처는 [${settings.old.join(", ")}] 중에서만 선택할 수 있습니다.\n'${src}'은(는) 구디비 DB 출처가 아닙니다.`;
+  return "";
+}
+async function loadSettings() {
+  try {
+    const s = await getDoc(doc(db, "settings", "db"));
+    if (s.exists()) { const d = s.data(); settings = { realtime: d.realtime || [], old: d.old || [] }; }
+  } catch (e) { console.warn("설정을 불러오지 못해 기본값을 사용합니다.", e); }
+}
 
 /* ---------- 로그인 ---------- */
 $("#loginForm").addEventListener("submit", async e => {
@@ -71,9 +116,10 @@ onAuthStateChanged(auth, async user => {
     }
     const d = snap.data();
     me = { uid: user.uid, name: d.name, role: d.role, loginId: d.loginId };
-    $("#who").textContent = `${me.name} (${isAdmin() ? "관리자" : "영업사원"})`;
+    $("#who").textContent = `${me.name} (${roleLabel(me.role)})`;
     $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
-    tab = "list"; filterUid = ""; search = "";
+    tab = "list"; filterUid = ""; callUid = ""; search = ""; selected.clear();
+    await loadSettings();
     if (isAdmin()) await loadUsers();
     buildTabs(); await loadMonth(); render();
   } catch (err) {
@@ -87,42 +133,54 @@ onAuthStateChanged(auth, async user => {
 async function loadUsers() {
   const s = await getDocs(collection(db, "users"));
   users = s.docs.map(d => ({ uid: d.id, ...d.data() })).sort((a, b) => (a.name || "").localeCompare(b.name || "", "ko"));
+  const p = await getDocs(collection(db, "pending"));
+  pendings = p.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.name || "").localeCompare(b.name || "", "ko"));
+  // '담당자 이관 중'인 회원(대상 계정이 아직 없음)을 대상 이름·아이디별로 묶는다.
+  const t = await getDocs(query(collection(db, "contracts"), where("transferLoginId", ">", "")));
+  const g = new Map();
+  t.docs.forEach(d => {
+    const v = d.data(), k = `${v.transferLoginId}|${nk(v.transferName)}`;
+    const o = g.get(k) || { loginId: v.transferLoginId, name: v.transferName, count: 0, froms: new Set() };
+    o.count++; o.froms.add(v.ownerUid); g.set(k, o);
+  });
+  transfers = [...g.values()];
 }
 async function loadMonth() {
   const own = (isAdmin() ? (filterUid ? [where("ownerUid", "==", filterUid)] : []) : [where("ownerUid", "==", me.uid)]);
-  const [a, b, c] = await Promise.all([
+  const [a, c] = await Promise.all([
     getDocs(query(collection(db, "contracts"), ...own, where("ym", "==", ym))),
-    getDocs(query(collection(db, "contracts"), ...own, where("upYm", "==", ym))),
     getDocs(query(collection(db, "daily"), ...own, where("ym", "==", ym)))
   ]);
-  const map = new Map();
-  [...a.docs, ...b.docs].forEach(d => map.set(d.id, { id: d.id, ...d.data() }));
-  contracts = [...map.values()];
+  contracts = a.docs.map(d => ({ id: d.id, ...d.data() }));
   dailies = c.docs.map(d => ({ id: d.id, ...d.data() }));
 }
 
 /* ---------- 탭 ---------- */
 function buildTabs() {
-  const items = [["list", "회원 목록·입력"], ["stats", "일별 통계"]];
+  const items = [["list", "회원 목록·입력"], ["calls", "일별 콜량 입력"], ["stats", "일별 통계"]];
   if (isAdmin()) items.push(["users", "사원 관리"]);
+  if (isSuper()) items.push(["settings", "DB 출처 설정"]);
   $("#tabs").innerHTML = items.map(([k, l]) => `<button data-t="${k}" class="${k === tab ? "on" : ""}">${l}</button>`).join("");
   $("#tabs").onclick = async e => {
     const t = e.target.dataset.t; if (!t) return;
     tab = t; buildTabs();
     if (t === "users") await loadUsers();
+    if (t === "settings") { await loadSettings(); draft = null; }
     render();
   };
 }
 function render() {
   if (tab === "list") renderList();
+  else if (tab === "calls") renderCalls();
   else if (tab === "stats") renderStats();
-  else renderUsers();
+  else if (tab === "users") renderUsers();
+  else if (tab === "settings") renderSettings();
 }
 
 /* ---------- 공통 바 (월/사원 선택) ---------- */
 function monthBar(extra = "") {
   const sel = isAdmin()
-    ? `<div><label>사원</label><select id="fUid"><option value="">전체</option>${users.map(u => `<option value="${u.uid}" ${u.uid === filterUid ? "selected" : ""}>${esc(u.name)}</option>`).join("")}</select></div>` : "";
+    ? `<div><label>사원</label><select id="fUid"><option value="">전체</option>${ownerOptions(filterUid)}</select></div>` : "";
   return `<div class="bar"><div><label>조회 월</label><input type="month" id="fYm" value="${ym}"></div>${sel}${extra}</div>`;
 }
 function bindMonthBar() {
@@ -134,96 +192,152 @@ function bindMonthBar() {
 function renderList() {
   const kw = search.trim().toLowerCase();
   const rows = contracts
-    .filter(c => c.ym === ym)
-    .filter(c => !kw || `${c.name} ${c.phone} ${c.dbSource} ${c.note}`.toLowerCase().includes(kw))
+    .filter(c => !kw || `${c.name} ${c.phone} ${c.dbSource} ${c.note} ${c.upsellNote}`.toLowerCase().includes(kw))
     .sort((a, b) => (b.date || "").localeCompare(a.date || "") || ((b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0)));
-  const sNew = rows.reduce((s, c) => s + (c.newAmount || 0), 0);
-  const sUp = contracts.filter(c => c.upYm === ym).reduce((s, c) => s + (c.upsellAmount || 0), 0);
+  const ok = rows.filter(c => !isRefund(c));
+  const sNew = ok.filter(c => !isUpsell(c)).reduce((s, c) => s + amt(c), 0);
+  const sUp = ok.filter(isUpsell).reduce((s, c) => s + amt(c), 0);
+  const refunds = rows.filter(isRefund), sRef = refunds.reduce((s, c) => s + amt(c), 0);
+  const adm = isAdmin();
 
   $("#view").innerHTML = `
     <div class="card">
-      ${isAdmin() ? "" : dailyBox()}
       ${monthBar(`<div class="grow"><label>검색 (이름·전화·DB·비고)</label><input id="fSearch" value="${esc(search)}" placeholder="검색어"></div>
         <button class="btn" id="btnNew">+ 회원 추가</button>
+        ${adm ? '<button class="btn ghost" id="btnTr">선택 회원 이관</button><button class="btn danger" id="btnDel">선택 삭제</button>' : ""}
         <button class="btn ghost" id="btnImp">엑셀 가져오기</button>
         <button class="btn ghost" id="btnCsv">엑셀(CSV) 저장</button>`)}
       <div class="sum">
-        <div><span class="muted">건수</span><b>${rows.length}건</b></div>
+        <div><span class="muted">건수 (환불 제외)</span><b>${ok.length}건</b></div>
         <div><span class="muted">신규 금액</span><b>${won(sNew)}원</b></div>
         <div><span class="muted">업셀 금액</span><b>${won(sUp)}원</b></div>
-        <div><span class="muted">합계</span><b>${won(sNew + sUp)}원</b></div>
+        <div><span class="muted">환불 ${refunds.length}건</span><b style="color:var(--red)">${won(sRef)}원</b></div>
+        <div><span class="muted">합계 (환불 반영)</span><b>${won(sNew + sUp + sRef)}원</b></div>
       </div>
       <div class="tblwrap"><table>
-        <thead><tr><th>신규 날짜</th>${isAdmin() ? "<th>담당자</th>" : ""}<th>회원명</th><th>전화번호</th><th>DB 출처</th><th>상태</th><th>등급</th><th class="n">신규 금액</th><th>업셀 날짜</th><th class="n">업셀 금액</th><th>비고</th></tr></thead>
-        <tbody>${rows.map(c => `<tr class="click" data-id="${c.id}">
-          <td>${esc(c.date)}</td>${isAdmin() ? `<td>${esc(nameOf(c.ownerUid))}</td>` : ""}<td>${esc(c.name)}</td><td>${esc(c.phone)}</td>
-          <td>${esc(c.dbSource)}</td><td>${esc(c.status)}</td><td>${esc(c.grade)}</td>
-          <td class="n">${won(c.newAmount)}</td><td>${esc(c.upsellDate)}</td><td class="n">${c.upsellAmount ? won(c.upsellAmount) : ""}</td>
-          <td>${esc((c.note || "").slice(0, 20))}</td></tr>`).join("") || `<tr><td colspan="11" class="muted" style="padding:24px;text-align:center">데이터가 없습니다.</td></tr>`}</tbody>
+        <thead><tr>${adm ? '<th><input type="checkbox" id="selAll" style="width:auto"></th>' : ""}<th>입금 날짜</th>${adm ? "<th>담당자</th><th>담당자 이관 중</th>" : ""}<th>회원명</th><th>전화번호</th><th>DB 출처</th><th>상태</th><th>계약 분류</th><th>등급 분류</th><th class="n">계약 금액</th><th>환불</th><th>계약 기간</th><th>업셀 여부 / 비고</th></tr></thead>
+        <tbody>${rows.map((c, i) => `<tr class="click ${isRefund(c) ? "refund" : ""}" data-id="${c.id}">
+          ${adm ? `<td class="sel"><input type="checkbox" data-sel="${c.id}" data-idx="${i}" style="width:auto" ${selected.has(c.id) ? "checked" : ""}></td>` : ""}
+          <td>${esc(c.date)}</td>${adm ? `<td>${esc(nameOf(c.ownerUid))}</td><td>${c.transferLoginId ? `<span class="tag warn">→ ${esc(c.transferName)} (${esc(c.transferLoginId)})</span>` : ""}</td>` : ""}
+          <td>${esc(c.name)}</td><td>${esc(c.phone)}</td><td>${esc(c.dbSource)}</td><td>${esc(c.status)}</td><td>${esc(c.contractType)}</td><td>${esc(c.grade)}</td>
+          <td class="n">${won(amt(c))}</td><td>${isRefund(c) ? '<span class="tag off">환불</span>' : ""}</td><td>${esc(c.period)}</td>
+          <td>${esc([c.upsellNote, c.note].filter(Boolean).join(" / ").slice(0, 24))}</td></tr>`).join("") || `<tr><td colspan="14" class="muted" style="padding:24px;text-align:center">데이터가 없습니다.</td></tr>`}</tbody>
       </table></div>
-      <p class="muted">행을 누르면 수정·삭제할 수 있습니다. 업셀이 다른 달에 발생한 건은 업셀 금액만 해당 월 합계에 포함됩니다.</p>
+      <p class="muted">행을 누르면 수정·삭제할 수 있습니다. 환불(계약 금액이 음수) 행은 빨간 배경으로 표시되며, 누르면 본 계약을 확인할 수 있습니다.${adm ? " 체크박스는 Shift를 누른 채 클릭하면 연속으로 선택됩니다." : ""}</p>
     </div>`;
   bindMonthBar();
   $("#fSearch").oninput = e => { search = e.target.value; const pos = e.target.selectionStart; renderList(); const i = $("#fSearch"); i.focus(); i.setSelectionRange(pos, pos); };
   $("#btnNew").onclick = () => openForm(null);
   $("#btnCsv").onclick = () => exportCsv(rows);
   $("#btnImp").onclick = openImport;
+  if (adm) {
+    const visible = new Set(rows.map(c => c.id));
+    [...selected].forEach(id => { if (!visible.has(id)) selected.delete(id); });
+    const cbs = [...$("#view").querySelectorAll("input[data-sel]")];
+    const upd = () => {
+      $("#btnTr").textContent = selected.size ? `선택 회원 이관 (${selected.size})` : "선택 회원 이관";
+      $("#btnDel").textContent = selected.size ? `선택 삭제 (${selected.size})` : "선택 삭제";
+      $("#selAll").checked = rows.length > 0 && selected.size === rows.length;
+    };
+    upd();
+    $("#selAll").onchange = e => { rows.forEach(c => e.target.checked ? selected.add(c.id) : selected.delete(c.id)); cbs.forEach(cb => cb.checked = e.target.checked); upd(); };
+    let last = -1;   // 마지막으로 클릭한 체크박스 위치 (Shift 연속 선택용)
+    cbs.forEach(cb => cb.onclick = e => {
+      const i = +cb.dataset.idx, on = cb.checked;
+      if (e.shiftKey && last >= 0) {
+        for (let k = Math.min(i, last); k <= Math.max(i, last); k++) { cbs[k].checked = on; on ? selected.add(rows[k].id) : selected.delete(rows[k].id); }
+      } else on ? selected.add(cb.dataset.sel) : selected.delete(cb.dataset.sel);
+      last = i; upd();
+    });
+    $("#btnTr").onclick = transferSelected;
+    $("#btnDel").onclick = deleteSelected;
+  }
   $("#view").querySelector("tbody").onclick = e => {
+    if (e.target.closest("td.sel") || e.target.closest("input")) return;
     const tr = e.target.closest("tr[data-id]"); if (!tr) return;
-    openForm(contracts.find(c => c.id === tr.dataset.id));
+    const c = contracts.find(x => x.id === tr.dataset.id);
+    if (isRefund(c)) askRefund(c); else openForm(c);
   };
-  if (!isAdmin()) bindDaily();
 }
 
-/* ---------- 일별 콜량 입력 박스 ---------- */
-function dailyBox() {
-  return `<div class="bar" style="padding-bottom:12px;border-bottom:1px dashed var(--line)">
-    <div><label>콜량 입력 날짜</label><input type="date" id="dDate" value="${todayStr()}"></div>
-    <div><label>콜량 (건)</label><input type="number" id="dCount" min="0" inputmode="numeric"></div>
-    <div><label>콜 시간</label><input id="dTime" placeholder="예: 2시간 30분"></div>
-    <button class="btn" id="dSave">콜량 저장</button></div>`;
+async function deleteSelected() {
+  if (!selected.size) return toast("삭제할 회원을 먼저 체크하세요.");
+  if (!confirm(`체크한 회원 ${selected.size}건을 삭제할까요?\n삭제하면 되돌릴 수 없습니다.`)) return;
+  try {
+    await commitOps([...selected].map(id => b => b.delete(doc(db, "contracts", id))));
+    const n = selected.size; selected.clear();
+    await loadMonth(); render(); toast(`${n}건을 삭제했습니다.`);
+  } catch (er) { console.error(er); toast("삭제 실패: " + (er.code || er.message)); }
 }
-async function loadDailyInto() {
-  const date = $("#dDate").value; if (!date) return;
-  const s = await getDoc(doc(db, "daily", `${me.uid}_${date}`));
-  $("#dCount").value = s.exists() ? s.data().callCount ?? "" : "";
-  $("#dTime").value = s.exists() ? s.data().callTime ?? "" : "";
-}
-function bindDaily() {
-  $("#dDate").onchange = loadDailyInto; loadDailyInto();
-  $("#dSave").onclick = async () => {
-    const date = $("#dDate").value; if (!date) return toast("날짜를 선택하세요.");
+
+/* ---------- 환불 행 → 본 계약 확인 ---------- */
+function askRefund(c) {
+  $("#modalRoot").innerHTML = `<div class="modal"><div class="box" style="max-width:420px">
+    <h2>환불 건</h2>
+    <p style="margin:0 0 6px"><b>${esc(c.name)}</b> (${esc(c.phone)}) · ${won(amt(c))}원</p>
+    <p>해당 회원의 본 계약 건을 확인하시겠습니까?</p>
+    <div class="actions"><button class="btn ghost" id="rno">아니오 (이 환불 건 수정)</button><button class="btn" id="ryes">예</button></div></div></div>`;
+  $("#rno").onclick = () => { closeModal(); openForm(c); };
+  $("#ryes").onclick = async () => {
+    closeModal();
+    const key = digits(c.phone);
+    if (!key) return alert("이 환불 건에 전화번호가 없어 본 계약을 찾을 수 없습니다.");
     try {
-      await setDoc(doc(db, "daily", `${me.uid}_${date}`), {
-        ownerUid: me.uid, date, ym: date.slice(0, 7),
-        callCount: toNum($("#dCount").value), callTime: $("#dTime").value.trim(), updatedAt: serverTimestamp()
-      });
-      toast("콜량이 저장되었습니다.");
-      if (date.slice(0, 7) === ym) { await loadMonth(); }
-    } catch (e) { console.error(e); toast("저장 실패: " + (e.code || e.message)); }
+      const own = isAdmin() ? [] : [where("ownerUid", "==", me.uid)];
+      const s = await getDocs(query(collection(db, "contracts"), ...own, where("phoneKey", "==", key)));
+      const list = s.docs.map(d => ({ id: d.id, ...d.data() }))
+        .filter(x => x.id !== c.id && nk(x.name) === nk(c.name) && amt(x) >= 0)
+        .sort((a, b) => (a.date || "").localeCompare(b.date || "") || ((a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0)));
+      if (!list.length) return alert("회원명과 전화번호가 모두 일치하는 본 계약 건이 없습니다.");
+      showOriginals(list, c);
+    } catch (er) { console.error(er); alert("본 계약을 불러오지 못했습니다: " + (er.code || er.message)); }
   };
+}
+function showOriginals(list, refund) {
+  let i = list.length - 1;     // 가장 최근 계약부터
+  const draw = () => {
+    const x = list[i];
+    const row = (k, v) => `<dt>${k}</dt><dd>${v === "" || v == null ? '<span class="muted">-</span>' : esc(v)}</dd>`;
+    $("#modalRoot").innerHTML = `<div class="modal"><div class="box" style="max-width:760px">
+      <div class="vhead"><b>${esc(refund.name)} (${esc(refund.phone)}) 님의 본 계약</b><span class="muted">${i + 1} / ${list.length}${i === list.length - 1 ? " · 가장 최근" : ""}</span></div>
+      <div class="vrow">
+        <button class="vnav" id="vprev" title="이전 계약" ${i === 0 ? "disabled" : ""}>&lt;</button>
+        <dl class="vcard">
+          ${row("입금 날짜", x.date)}${isAdmin() ? row("담당자", nameOf(x.ownerUid)) : ""}${row("회원명", x.name)}${row("전화번호", x.phone)}
+          ${row("DB 출처", x.dbSource)}${row("상태", x.status)}${row("계약 분류", x.contractType)}${row("등급 분류", x.grade)}
+          ${row("계약 금액", won(amt(x)) + "원")}${row("계약 기간", x.period)}${row("무료 바우처", x.voucher)}${row("업셀 여부", x.upsellNote)}${row("비고", x.note)}
+        </dl>
+        <button class="vnav" id="vnext" title="다음 계약" ${i === list.length - 1 ? "disabled" : ""}>&gt;</button>
+      </div>
+      <div class="actions"><button class="btn ghost" id="vedit">이 계약 수정</button><button class="btn" id="vclose">닫기</button></div></div></div>`;
+    $("#vprev").onclick = () => { if (i > 0) { i--; draw(); } };
+    $("#vnext").onclick = () => { if (i < list.length - 1) { i++; draw(); } };
+    $("#vclose").onclick = closeModal;
+    $("#vedit").onclick = () => { closeModal(); openForm(x); };
+  };
+  draw();
 }
 
 /* ---------- 회원 입력/수정 모달 ---------- */
 function openForm(c) {
-  const e = c || { date: todayStr(), status: OPTIONS.status[0], contractType: OPTIONS.contractType[0], grades: [] };
+  const e = c || { date: todayStr(), status: "", contractType: OPTIONS.contractType[0], grades: [] };
   const opt = (arr, v) => `<option value=""></option>` + (v && !arr.includes(v) ? [...arr, v] : arr).map(x => `<option ${x === v ? "selected" : ""}>${esc(x)}</option>`).join("");
   $("#modalRoot").innerHTML = `<div class="modal"><form class="box" id="cf">
     <h2>${c ? "회원 정보 수정" : "회원 추가"}</h2>
     <div class="grid">
-      <div><label>신규 날짜 *</label><input type="date" name="date" value="${esc(e.date)}" required></div>
+      ${isAdmin() ? `<div class="full"><label>담당자</label><select name="owner">${ownerOptions(c ? c.ownerUid : (filterUid || me.uid))}</select></div>` : ""}
+      <div><label>입금 날짜 *</label><input type="date" name="date" value="${esc(e.date)}" required></div>
       <div><label>회원명 *</label><input name="name" value="${esc(e.name)}" required></div>
       <div><label>전화번호 *</label><input name="phone" inputmode="tel" value="${esc(e.phone)}" required></div>
-      <div><label>DB 출처</label><select name="dbSource">${opt(OPTIONS.dbSource, e.dbSource)}</select></div>
+      <div><label>DB 출처 (실시간/구디비 구분 표시)</label><select name="dbSource">${dbOptions(e.dbSource)}</select></div>
       <div><label>상태</label><select name="status">${opt(OPTIONS.status, e.status)}</select></div>
       <div><label>계약 분류</label><select name="contractType">${opt(OPTIONS.contractType, e.contractType)}</select></div>
       <div class="full"><label>등급 분류 (복수 선택)</label><div class="chk">${[...new Set([...OPTIONS.grades, ...(e.grades || [])])].map(g => `<label><input type="checkbox" name="grades" value="${esc(g)}" ${(e.grades || []).includes(g) ? "checked" : ""}>${esc(g)}</label>`).join("")}</div></div>
-      <div><label>신규 금액 (원)</label><input name="newAmount" inputmode="numeric" value="${e.newAmount ? won(e.newAmount) : ""}"></div>
-      <div><label>계약 기간</label><input name="period" value="${esc(e.period)}" placeholder="예: 6개월"></div>
-      <div class="full"><label>업셀 여부 / 내용</label><textarea name="upsellNote">${esc(e.upsellNote)}</textarea></div>
-      <div><label>업셀 날짜</label><input type="date" name="upsellDate" value="${esc(e.upsellDate)}"></div>
-      <div><label>업셀 금액 (원)</label><input name="upsellAmount" inputmode="numeric" value="${e.upsellAmount ? won(e.upsellAmount) : ""}"></div>
-      <div class="full"><label>무료 바우처</label><input name="voucher" value="${esc(e.voucher)}"></div>
+      <div><label>계약 금액 (원) — 환불은 음수(-)로 입력</label><input name="amount" inputmode="numeric" value="${e.amount ? won(e.amount) : ""}"></div>
+      <div><label>계약 기간</label><input name="period" value="${esc(e.period)}" placeholder="예: 26. 10. 1 ~ 26. 11. 1"></div>
+      <div class="full" id="rhint" style="margin-top:-6px"></div>
+      <div><label>무료 바우처</label><input name="voucher" value="${esc(e.voucher)}"></div>
+      <div><label>업셀 여부</label><input name="upsellNote" value="${esc(e.upsellNote)}" placeholder="자유 기재"></div>
       <div class="full"><label>비고</label><textarea name="note">${esc(e.note)}</textarea></div>
     </div>
     <div class="err" id="cerr"></div>
@@ -232,7 +346,11 @@ function openForm(c) {
   </form></div>`;
   const f = $("#cf");
   f.phone.onblur = () => f.phone.value = fmtPhone(f.phone.value);
-  ["newAmount", "upsellAmount"].forEach(n => f[n].onblur = () => f[n].value = f[n].value ? won(toNum(f[n].value)) : "");
+  f.amount.onblur = () => f.amount.value = f.amount.value ? won(toNum(f.amount.value)) : "";
+  const hint = () => { $("#rhint").innerHTML = toNum(f.amount.value) < 0 ? '<span class="tag off">환불</span> <span class="muted">계약 금액이 0보다 작아 환불로 표시됩니다.</span>' : ""; };
+  f.amount.oninput = hint; hint();
+  const warn = () => { const m = checkSource(f.status.value, f.dbSource.value); if (m) alert(m); };
+  f.dbSource.onchange = warn; f.status.onchange = warn;
   $("#ccancel").onclick = closeModal;
   if (c) $("#cdel").onclick = async () => {
     if (!confirm(`'${c.name}' 회원을 삭제할까요? 되돌릴 수 없습니다.`)) return;
@@ -242,20 +360,21 @@ function openForm(c) {
   f.onsubmit = async ev => {
     ev.preventDefault();
     const v = new FormData(f);
+    const bad = checkSource(v.get("status"), v.get("dbSource"));
+    if (bad) { alert(bad); return; }
     const grades = v.getAll("grades");
-    const date = v.get("date"), upDate = v.get("upsellDate") || "";
+    const date = v.get("date"), phone = fmtPhone(v.get("phone").trim());
     const data = {
-      ownerUid: c ? c.ownerUid : me.uid,
+      ownerUid: isAdmin() ? v.get("owner") : (c ? c.ownerUid : me.uid),
       date, ym: date.slice(0, 7),
-      name: v.get("name").trim(), phone: fmtPhone(v.get("phone").trim()),
+      name: v.get("name").trim(), phone, phoneKey: digits(phone),
       dbSource: v.get("dbSource"), status: v.get("status"), contractType: v.get("contractType"),
       grades, grade: grades.join(", "),
-      newAmount: toNum(v.get("newAmount")), period: v.get("period").trim(),
-      upsellNote: v.get("upsellNote").trim(), upsellDate: upDate, upYm: upDate ? upDate.slice(0, 7) : "",
-      upsellAmount: toNum(v.get("upsellAmount")),
-      voucher: v.get("voucher").trim(), note: v.get("note").trim(),
+      amount: toNum(v.get("amount")), period: v.get("period").trim(),
+      voucher: v.get("voucher").trim(), upsellNote: v.get("upsellNote").trim(), note: v.get("note").trim(),
       updatedAt: serverTimestamp()
     };
+    if (isAdmin() && c && data.ownerUid !== c.ownerUid) { data.transferName = deleteField(); data.transferLoginId = deleteField(); }
     try {
       if (c) await updateDoc(doc(db, "contracts", c.id), data);
       else { data.createdAt = serverTimestamp(); await addDoc(collection(db, "contracts"), data); }
@@ -265,16 +384,68 @@ function openForm(c) {
     } catch (er) { console.error(er); $("#cerr").textContent = "저장 실패: " + (er.code || er.message); }
   };
 }
-function closeModal() { $("#modalRoot").innerHTML = ""; }
 
 /* ---------- CSV ---------- */
+const csvQ = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+function downloadCsv(lines, name) {
+  const blob = new Blob(["﻿" + lines.map(r => r.map(csvQ).join(",")).join("\r\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click(); URL.revokeObjectURL(a.href);
+}
 function exportCsv(rows) {
-  const head = ["신규 날짜", "담당자", "회원명", "전화번호", "DB 출처", "상태", "계약 분류", "등급 분류", "신규 금액", "업셀 여부", "업셀 날짜", "업셀 금액", "계약 기간", "무료 바우처", "비고"];
-  const q = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
-  const lines = [head.map(q).join(",")].concat(rows.map(c => [c.date, nameOf(c.ownerUid), c.name, c.phone, c.dbSource, c.status, c.contractType, c.grade, c.newAmount || "", c.upsellNote, c.upsellDate, c.upsellAmount || "", c.period, c.voucher, c.note].map(q).join(",")));
-  const blob = new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
-  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-  a.download = `회원목록_${ym}.csv`; a.click(); URL.revokeObjectURL(a.href);
+  const head = ["입금 날짜", "담당자", "회원명", "전화번호", "DB 출처", "상태", "계약 분류", "등급 분류", "계약 금액", "환불", "계약 기간", "무료 바우처", "업셀 여부", "비고", "이관 중 대상"];
+  downloadCsv([head, ...rows.map(c => [c.date, nameOf(c.ownerUid), c.name, c.phone, c.dbSource, c.status, c.contractType, c.grade, amt(c), isRefund(c) ? "환불" : "", c.period, c.voucher, c.upsellNote, c.note, c.transferLoginId ? `${c.transferName}(${c.transferLoginId})` : ""])], `회원목록_${ym}.csv`);
+}
+
+/* ---------- 일별 콜량 입력 ---------- */
+async function renderCalls() {
+  if (isAdmin() && !callUid) callUid = filterUid || users.find(u => u.role === "sales")?.uid || "";
+  const owner = isAdmin() ? callUid : me.uid;
+  const [y, m] = ym.split("-").map(Number);
+  const last = new Date(y, m, 0).getDate();
+  const days = Array.from({ length: last }, (_, i) => `${ym}-${pad(i + 1)}`);
+  let list = [];
+  if (owner) {
+    try {
+      const s = await getDocs(query(collection(db, "daily"), where("ownerUid", "==", owner), where("ym", "==", ym)));
+      list = s.docs.map(d => ({ id: d.id, ...d.data() }));
+    } catch (er) { console.error(er); toast("콜량을 불러오지 못했습니다: " + (er.code || er.message)); }
+  }
+  if (tab !== "calls") return;
+  const byDate = new Map(list.map(x => [x.date, x]));
+  const wd = d => "일월화수목금토"[new Date(d + "T00:00:00").getDay()];
+  const today = todayStr();
+  $("#view").innerHTML = `<div class="card">
+    <div class="bar"><div><label>조회 월</label><input type="month" id="cYm" value="${ym}"></div>
+      ${isAdmin() ? `<div><label>사원</label><select id="cUid"><option value="">선택하세요</option>${ownerOptions(callUid)}</select></div>` : ""}
+      <button class="btn" id="cSave">저장</button></div>
+    ${owner ? `<p class="muted" style="margin-top:0">날짜별 콜량(건)과 콜 시간(분)을 입력하고 <b>저장</b>을 누르세요. 비워 두면 0으로 처리됩니다. 입력 후 저장하지 않고 다른 화면으로 가면 사라집니다.</p>
+    <div class="tblwrap"><table><thead><tr><th>날짜</th><th class="n">콜량 (건)</th><th class="n">콜 시간 (분)</th></tr></thead>
+      <tbody>${days.map(d => { const x = byDate.get(d); return `<tr class="${d === today ? "today" : ""}"><td>${d.slice(5).replace("-", "/")} (${wd(d)})</td>
+        <td class="n"><input type="number" min="0" class="cc" data-d="${d}" value="${x?.callCount ?? ""}" style="max-width:110px;text-align:right"></td>
+        <td class="n"><input type="number" min="0" class="ct" data-d="${d}" value="${x?.callTime ?? ""}" style="max-width:110px;text-align:right"></td></tr>`; }).join("")}</tbody>
+      <tfoot><tr><td>합계</td><td class="n" id="sumC"></td><td class="n" id="sumT"></td></tr></tfoot></table></div>`
+    : `<p class="muted">입력할 사원을 선택하세요.</p>`}</div>`;
+  $("#cYm").onchange = async e => { if (!e.target.value) return; ym = e.target.value; await loadMonth(); renderCalls(); };
+  if (isAdmin()) $("#cUid").onchange = e => { callUid = e.target.value; renderCalls(); };
+  if (!owner) { $("#cSave").disabled = true; return; }
+  const sums = () => {
+    const sum = sel => [...$("#view").querySelectorAll(sel)].reduce((s, i) => s + toNum(i.value), 0);
+    $("#sumC").textContent = won(sum("input.cc")); $("#sumT").textContent = won(sum("input.ct"));
+  };
+  sums(); $("#view").querySelectorAll("input.cc,input.ct").forEach(i => i.oninput = sums);
+  const t = $("#view").querySelector("tr.today"); if (t) t.scrollIntoView({ block: "center" });
+  $("#cSave").onclick = async () => {
+    const ops = [];
+    days.forEach(d => {
+      const cc = toNum($(`input.cc[data-d="${d}"]`).value), ct = toNum($(`input.ct[data-d="${d}"]`).value);
+      const old = byDate.get(d);
+      if ((old?.callCount || 0) === cc && (old?.callTime || 0) === ct) return;
+      ops.push(b => b.set(doc(db, "daily", `${owner}_${d}`), { ownerUid: owner, date: d, ym, callCount: cc, callTime: ct, updatedAt: serverTimestamp() }, { merge: true }));
+    });
+    if (!ops.length) return toast("바뀐 내용이 없습니다.");
+    try { await commitOps(ops); toast(`${ops.length}일치를 저장했습니다.`); await loadMonth(); renderCalls(); }
+    catch (er) { console.error(er); toast("저장 실패: " + (er.code || er.message)); }
+  };
 }
 
 /* ---------- 일별 통계 ---------- */
@@ -282,93 +453,337 @@ function renderStats() {
   const [y, m] = ym.split("-").map(Number);
   const last = new Date(y, m, 0).getDate();
   const days = Array.from({ length: last }, (_, i) => `${ym}-${pad(i + 1)}`);
-  const tot = { live: 0, old: 0, all: 0, calls: 0, nw: 0, up: 0 };
+  const tot = { live: 0, old: 0, all: 0, calls: 0, time: 0, nw: 0, up: 0, ref: 0 };
+  const lines = [];
   const body = days.map(d => {
     const on = contracts.filter(c => c.date === d);
-    const live = on.filter(c => c.dbSource === "급등" && c.status === "실시간").length;
-    const old = on.filter(c => c.status === "구디비").length;
+    const real = on.filter(c => !isRefund(c) && !isUpsell(c));          // 신규 계약만 건수에 포함
+    const live = real.filter(c => c.status === "실시간").length;
+    const old = real.filter(c => c.status === "구디비").length;
     const dl = dailies.filter(x => x.date === d);
-    const calls = dl.reduce((s, x) => s + (x.callCount || 0), 0);
-    const times = [...new Set(dl.map(x => x.callTime).filter(Boolean))].join(", ");
-    const nw = on.reduce((s, c) => s + (c.newAmount || 0), 0);
-    const up = contracts.filter(c => c.upsellDate === d).reduce((s, c) => s + (c.upsellAmount || 0), 0);
-    tot.live += live; tot.old += old; tot.all += on.length; tot.calls += calls; tot.nw += nw; tot.up += up;
-    return `<tr><td>${d.slice(5).replace("-", "/")}</td><td class="n">${live || ""}</td><td class="n">${old || ""}</td><td class="n">${on.length || ""}</td><td class="n">${calls || ""}</td><td>${esc(times)}</td><td class="n">${nw ? won(nw) : ""}</td><td class="n">${up ? won(up) : ""}</td><td class="n">${nw + up ? won(nw + up) : ""}</td></tr>`;
+    const calls = dl.reduce((s, x) => s + (x.callCount || 0), 0), time = dl.reduce((s, x) => s + (x.callTime || 0), 0);
+    const nw = on.filter(c => !isRefund(c) && !isUpsell(c)).reduce((s, c) => s + amt(c), 0);
+    const up = on.filter(c => !isRefund(c) && isUpsell(c)).reduce((s, c) => s + amt(c), 0);
+    const ref = on.filter(isRefund).reduce((s, c) => s + amt(c), 0);
+    tot.live += live; tot.old += old; tot.all += real.length; tot.calls += calls; tot.time += time; tot.nw += nw; tot.up += up; tot.ref += ref;
+    const v = [d.slice(5).replace("-", "/"), live, old, real.length, calls, time, nw, up, ref, nw + up + ref];
+    lines.push(v);
+    const z = x => x ? won(x) : "";
+    return `<tr><td>${v[0]}</td><td class="n">${live || ""}</td><td class="n">${old || ""}</td><td class="n">${real.length || ""}</td><td class="n">${z(calls)}</td><td class="n">${z(time)}</td><td class="n">${z(nw)}</td><td class="n">${z(up)}</td><td class="n" style="color:var(--red)">${z(ref)}</td><td class="n">${z(nw + up + ref)}</td></tr>`;
   }).join("");
 
   let perUser = "";
   if (isAdmin() && !filterUid) {
-    const rows = users.map(u => {
+    const owners = [...users.map(u => ({ uid: u.uid, name: u.name })), ...pendings.map(x => ({ uid: PEND + x.name, name: x.name + " (미가입)" }))];
+    const rows = owners.map(u => {
       const mine = contracts.filter(c => c.ownerUid === u.uid);
-      const cnt = mine.filter(c => c.ym === ym).length;
-      const nw = mine.filter(c => c.ym === ym).reduce((s, c) => s + (c.newAmount || 0), 0);
-      const up = mine.filter(c => c.upYm === ym).reduce((s, c) => s + (c.upsellAmount || 0), 0);
-      const calls = dailies.filter(x => x.ownerUid === u.uid).reduce((s, x) => s + (x.callCount || 0), 0);
-      return { u, cnt, nw, up, calls };
+      const real = mine.filter(c => !isRefund(c) && !isUpsell(c));
+      const nw = real.reduce((s, c) => s + amt(c), 0);
+      const up = mine.filter(c => !isRefund(c) && isUpsell(c)).reduce((s, c) => s + amt(c), 0);
+      const ref = mine.filter(isRefund).reduce((s, c) => s + amt(c), 0);
+      const dl = dailies.filter(x => x.ownerUid === u.uid);
+      return { u, cnt: real.length, calls: dl.reduce((s, x) => s + (x.callCount || 0), 0), time: dl.reduce((s, x) => s + (x.callTime || 0), 0), nw, up, ref };
     });
     perUser = `<h3 style="margin:22px 0 8px">사원별 합계</h3><div class="tblwrap"><table>
-      <thead><tr><th>사원</th><th class="n">건수</th><th class="n">콜량</th><th class="n">신규 금액</th><th class="n">업셀 금액</th><th class="n">총합계</th></tr></thead>
-      <tbody>${rows.map(r => `<tr><td>${esc(r.u.name)}</td><td class="n">${r.cnt}</td><td class="n">${won(r.calls)}</td><td class="n">${won(r.nw)}</td><td class="n">${won(r.up)}</td><td class="n">${won(r.nw + r.up)}</td></tr>`).join("")}</tbody></table></div>`;
+      <thead><tr><th>사원</th><th class="n">건수</th><th class="n">콜량</th><th class="n">콜 시간(분)</th><th class="n">신규 금액</th><th class="n">업셀 금액</th><th class="n">환불 금액</th><th class="n">총합계</th></tr></thead>
+      <tbody>${rows.map(r => `<tr><td>${esc(r.u.name)}</td><td class="n">${r.cnt}</td><td class="n">${won(r.calls)}</td><td class="n">${won(r.time)}</td><td class="n">${won(r.nw)}</td><td class="n">${won(r.up)}</td><td class="n" style="color:var(--red)">${won(r.ref)}</td><td class="n">${won(r.nw + r.up + r.ref)}</td></tr>`).join("")}</tbody></table></div>`;
   }
 
   $("#view").innerHTML = `<div class="card">${monthBar(`<button class="btn ghost" id="btnSCsv">통계 CSV 저장</button>`)}
     <div class="tblwrap"><table>
-      <thead><tr><th>날짜</th><th class="n">급등 실시간 수</th><th class="n">구디비 수</th><th class="n">전체 건수</th><th class="n">콜량</th><th>콜 시간</th><th class="n">신규 금액</th><th class="n">업셀 금액</th><th class="n">총합계</th></tr></thead>
+      <thead><tr><th>날짜</th><th class="n">실시간 수</th><th class="n">구디비 수</th><th class="n">전체 건수</th><th class="n">콜량</th><th class="n">콜 시간(분)</th><th class="n">신규 금액</th><th class="n">업셀 금액</th><th class="n">환불 금액</th><th class="n">총합계</th></tr></thead>
       <tbody>${body}</tbody>
-      <tfoot><tr><td>합계</td><td class="n">${tot.live}</td><td class="n">${tot.old}</td><td class="n">${tot.all}</td><td class="n">${won(tot.calls)}</td><td></td><td class="n">${won(tot.nw)}</td><td class="n">${won(tot.up)}</td><td class="n">${won(tot.nw + tot.up)}</td></tr></tfoot>
-    </table></div>${perUser}</div>`;
+      <tfoot><tr><td>합계</td><td class="n">${tot.live}</td><td class="n">${tot.old}</td><td class="n">${tot.all}</td><td class="n">${won(tot.calls)}</td><td class="n">${won(tot.time)}</td><td class="n">${won(tot.nw)}</td><td class="n">${won(tot.up)}</td><td class="n" style="color:var(--red)">${won(tot.ref)}</td><td class="n">${won(tot.nw + tot.up + tot.ref)}</td></tr></tfoot>
+    </table></div>
+    <p class="muted">건수는 '신규' 계약만 셉니다(업셀·환불 제외). 총합계 = 신규 + 업셀 + 환불(음수).</p>${perUser}</div>`;
   bindMonthBar();
-  $("#btnSCsv").onclick = () => {
-    const q = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
-    const out = [["날짜", "급등 실시간 수", "구디비 수", "전체 건수", "콜량", "콜 시간", "신규 금액", "업셀 금액", "총합계"]];
-    $("#view").querySelector("table").querySelectorAll("tbody tr").forEach(tr => out.push([...tr.children].map(td => td.textContent.replace(/,/g, ""))));
-    const blob = new Blob(["﻿" + out.map(r => r.map(q).join(",")).join("\r\n")], { type: "text/csv;charset=utf-8" });
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `일별통계_${ym}.csv`; a.click(); URL.revokeObjectURL(a.href);
-  };
+  $("#btnSCsv").onclick = () => downloadCsv([["날짜", "실시간 수", "구디비 수", "전체 건수", "콜량", "콜 시간(분)", "신규 금액", "업셀 금액", "환불 금액", "총합계"], ...lines], `일별통계_${ym}.csv`);
 }
 
-/* ---------- 사원 관리 (관리자) ---------- */
+async function commitOps(ops) {
+  for (let i = 0; i < ops.length; i += 200) { const b = writeBatch(db); ops.slice(i, i + 200).forEach(f => f(b)); await b.commit(); }
+}
+// 회원(cSnaps)·콜량(dSnaps) 문서를 to 담당자에게 옮기고 '이관 중' 표시를 지운다.
+async function moveDocs(cSnaps, dSnaps, to) {
+  const ops = [];
+  cSnaps.forEach(x => ops.push(b => b.update(x.ref, { ownerUid: to, updatedAt: serverTimestamp(), transferName: deleteField(), transferLoginId: deleteField() })));
+  dSnaps.forEach(x => {
+    const { transferName, transferLoginId, ...v } = x.data();
+    const nid = `${to}_${v.date}`;
+    if (nid === x.id) return;
+    ops.push(b => b.set(doc(db, "daily", nid), { ...v, ownerUid: to }, { merge: true }));
+    ops.push(b => b.delete(x.ref));
+  });
+  await commitOps(ops);
+}
+// from 담당자(ownerUid)의 회원·콜량 전체를 to 담당자에게 옮긴다.
+async function reassign(from, to) {
+  const [c, d] = await Promise.all([
+    getDocs(query(collection(db, "contracts"), where("ownerUid", "==", from))),
+    getDocs(query(collection(db, "daily"), where("ownerUid", "==", from)))
+  ]);
+  await moveDocs(c.docs, d.docs, to);
+  return c.size;
+}
+// 계정 이름과 같은 '미가입 담당자'가 있으면 그 데이터를 계정으로 연결한다. (이름만 같은 경우는 호출 전에 확인을 받는다)
+async function linkPendingFor(uid, name) {
+  const p = pendings.find(x => nk(x.name) === nk(name));
+  if (!p) return 0;
+  const n = await reassign(PEND + p.name, uid);
+  await deleteDoc(doc(db, "pending", p.id));
+  return n;
+}
+// 이름+아이디로 이관 대상 계정을 찾는다.
+function findTarget(name, loginId) {
+  const u = users.find(x => x.loginId === String(loginId).trim().toLowerCase());
+  if (!u) return { state: "none" };
+  return { state: nk(u.name) === nk(name) ? "exact" : "mismatch", user: u };
+}
+// 계정이 이미 있으면 바로 이관, 없으면 '이관 중' 표시만 해 두었다가 계정 생성 때 자동 이관한다.
+async function runTransfer({ contractIds, fromOwner, name, loginId }) {
+  loginId = loginId.trim().toLowerCase();
+  const t = findTarget(name, loginId);
+  if (t.state === "mismatch") throw new Error(`아이디 ${loginId}의 사원 이름은 '${t.user.name}'입니다. 이름과 아이디가 일치하지 않습니다.`);
+  if (t.state === "exact") {
+    if (fromOwner === t.user.uid) throw new Error("현재 담당자와 같은 사원입니다.");
+    let n;
+    if (fromOwner) {
+      n = await reassign(fromOwner, t.user.uid);
+      if (fromOwner.startsWith(PEND)) { const p = pendings.find(x => PEND + x.name === fromOwner); if (p) await deleteDoc(doc(db, "pending", p.id)); }
+    } else {
+      await moveDocs(contractIds.map(id => ({ ref: doc(db, "contracts", id) })), [], t.user.uid); n = contractIds.length;
+    }
+    return `${n}건을 ${t.user.name}(${t.user.loginId})에게 이관했습니다.`;
+  }
+  let refs = [];
+  if (fromOwner) {
+    const [c, d] = await Promise.all([
+      getDocs(query(collection(db, "contracts"), where("ownerUid", "==", fromOwner))),
+      getDocs(query(collection(db, "daily"), where("ownerUid", "==", fromOwner)))
+    ]);
+    refs = [...c.docs, ...d.docs].map(x => x.ref);
+  } else refs = contractIds.map(id => doc(db, "contracts", id));
+  await commitOps(refs.map(r => b => b.update(r, { transferName: name, transferLoginId: loginId })));
+  return `'담당자 이관 중'으로 표시했습니다. ${name}(${loginId}) 계정이 만들어지면 자동으로 이관됩니다.`;
+}
+function askTransfer(title, summary) {
+  return new Promise(res => {
+    $("#modalRoot").innerHTML = `<div class="modal"><form class="box" style="max-width:460px"><h2>${esc(title)}</h2>
+      <p class="muted" style="margin-top:0">${summary}</p>
+      <div class="grid"><div><label>옮길 사원 이름 *</label><input name="n" required autocomplete="off"></div>
+      <div><label>옮길 사원 아이디 *</label><input name="i" required autocomplete="off" autocapitalize="none"></div></div>
+      <div id="th" class="muted" style="margin-top:10px;min-height:44px"></div>
+      <div class="actions"><button type="button" class="btn ghost" id="tc">취소</button><button class="btn">이관</button></div></form></div>`;
+    const f = $("#modalRoot form");
+    const vals = () => [f.n.value.trim().replace(/\s+/g, " "), f.i.value.trim().toLowerCase()];
+    const upd = () => {
+      const [n, i] = vals(); if (!n || !i) { $("#th").innerHTML = ""; return; }
+      const t = findTarget(n, i);
+      $("#th").innerHTML = t.state === "exact" ? `→ 기존 사원 <b>${esc(t.user.name)}</b> (${esc(t.user.loginId)})에게 바로 이관됩니다.`
+        : t.state === "mismatch" ? `<span style="color:var(--red)">아이디 ${esc(i)}의 사원 이름은 '${esc(t.user.name)}'입니다. 이름과 아이디가 일치하지 않습니다.</span>`
+        : `→ 아직 이 계정이 없습니다. <b>담당자 이관 중</b>으로 표시해 두고, <b>${esc(n)} / ${esc(i)}</b> 계정이 만들어지면 자동으로 이관됩니다.`;
+    };
+    f.n.oninput = upd; f.i.oninput = upd;
+    $("#tc").onclick = () => { closeModal(); res(null); };
+    f.onsubmit = e => {
+      e.preventDefault(); const [n, i] = vals();
+      if (findTarget(n, i).state === "mismatch") return upd();
+      closeModal(); res({ name: n, loginId: i });
+    };
+  });
+}
+async function transferSelected() {
+  if (!selected.size) return toast("이관할 회원을 먼저 체크하세요.");
+  const t = await askTransfer("선택 회원 이관", `체크한 회원 <b>${selected.size}건</b>의 담당자를 옮깁니다. (일별 콜량 기록은 옮겨지지 않습니다)`);
+  if (!t) return;
+  try { const msg = await runTransfer({ contractIds: [...selected], ...t }); selected.clear(); await loadUsers(); await loadMonth(); render(); toast(msg); }
+  catch (er) { console.error(er); toast("실패: " + (er.message || er.code)); }
+}
+async function transferOwner(fromUid) {
+  const t = await askTransfer("담당자의 회원 전체 이관", `<b>${esc(nameOf(fromUid))}</b>의 모든 회원과 일별 콜량 기록을 옮깁니다.`);
+  if (!t) return;
+  try { const msg = await runTransfer({ fromOwner: fromUid, ...t }); await loadUsers(); renderUsers(); toast(msg); }
+  catch (er) { console.error(er); toast("실패: " + (er.message || er.code)); }
+}
+async function cancelTransfer(loginId) {
+  if (!confirm("이 '이관 중' 표시를 취소할까요? 회원은 지금 담당자에게 그대로 남습니다.")) return;
+  try {
+    const [c, d] = await Promise.all([
+      getDocs(query(collection(db, "contracts"), where("transferLoginId", "==", loginId))),
+      getDocs(query(collection(db, "daily"), where("transferLoginId", "==", loginId)))
+    ]);
+    await commitOps([...c.docs, ...d.docs].map(x => b => b.update(x.ref, { transferName: deleteField(), transferLoginId: deleteField() })));
+    await loadUsers(); renderUsers(); toast("이관을 취소했습니다.");
+  } catch (er) { toast("실패: " + (er.code || er.message)); }
+}
+// 새 계정이 만들어질 때, 이름+아이디가 일치하는 '이관 중' 회원을 넘겨받는다.
+async function completeTransfers(uid, loginId, name) {
+  const [c, d] = await Promise.all([
+    getDocs(query(collection(db, "contracts"), where("transferLoginId", "==", loginId))),
+    getDocs(query(collection(db, "daily"), where("transferLoginId", "==", loginId)))
+  ]);
+  const cs = c.docs.filter(x => nk(x.data().transferName) === nk(name)), ds = d.docs.filter(x => nk(x.data().transferName) === nk(name));
+  await moveDocs(cs, ds, uid);
+  return cs.length;
+}
+/* ---------- 사원 관리 ---------- */
+function askName(title, cur, hint = "") {
+  return new Promise(res => {
+    $("#modalRoot").innerHTML = `<div class="modal"><form class="box" style="max-width:400px"><h2>${esc(title)}</h2>
+      <div><label>이름</label><input name="n" value="${esc(cur)}" required></div>
+      <p class="muted">${hint}</p>
+      <div class="actions"><button type="button" class="btn ghost" id="nc">취소</button><button class="btn">확인</button></div></form></div>`;
+    $("#nc").onclick = () => { closeModal(); res(null); };
+    $("#modalRoot form").onsubmit = e => { e.preventDefault(); const v = e.target.n.value.trim().replace(/\s+/g, " "); closeModal(); res(v || null); };
+  });
+}
+async function renameUser(uid) {
+  const u = users.find(x => x.uid === uid); if (!u) return;
+  if (!(isSuper() || u.role === "sales")) return toast("관리자 계정의 이름은 슈퍼 관리자만 바꿀 수 있습니다.");
+  const nn = await askName("담당자 이름 변경", u.name, "이름만 바뀌고, 입력된 회원 데이터는 그대로 유지됩니다.");
+  if (!nn || nn === u.name) return;
+  if (users.some(x => x.uid !== uid && nk(x.name) === nk(nn))) return toast("같은 이름의 사원이 이미 있습니다.");
+  try {
+    await updateDoc(doc(db, "users", uid), { name: nn });
+    if (uid === me.uid) { me.name = nn; $("#who").textContent = `${me.name} (${roleLabel(me.role)})`; }
+    await loadUsers(); renderUsers();
+    toast("이름을 변경했습니다.");
+  } catch (er) { console.error(er); toast("실패: " + (er.code || er.message)); }
+}
+async function renamePending(id) {
+  const p = pendings.find(x => x.id === id); if (!p) return;
+  const nn = await askName("미가입 담당자 이름 변경", p.name, "이름(표기)만 바꿉니다. 계정이 있는(또는 만들 예정인) 사원에게 옮기려면 '회원 이관'을 사용하세요.");
+  if (!nn || nn === p.name) return;
+  try {
+    const target = users.find(x => nk(x.name) === nk(nn));
+    const other = pendings.find(x => x.id !== id && nk(x.name) === nk(nn));
+    if (target) return toast("이미 계정이 있는 사원에게 옮기려면 '회원 이관'을 사용하세요.");
+    const nm = other ? other.name : nn;
+    if (!other) await setDoc(doc(db, "pending", pendId(nm)), { name: nm, createdAt: serverTimestamp() }, { merge: true });
+    const n = await reassign(PEND + p.name, PEND + nm);
+    await deleteDoc(doc(db, "pending", p.id));
+    await loadUsers(); renderUsers();
+    toast(`${n}건의 담당자 표기를 '${nn}'(으)로 바꿨습니다.`);
+  } catch (er) { console.error(er); toast("실패: " + (er.code || er.message)); }
+}
 function renderUsers() {
+  const manage = u => isSuper() || u.role === "sales";
+  const roleOpts = isSuper()
+    ? `<option value="sales">영업사원</option><option value="admin">일반 관리자</option><option value="super">슈퍼 관리자</option>`
+    : `<option value="sales">영업사원</option>`;
   $("#view").innerHTML = `<div class="card">
     <h3 style="margin:0 0 10px">사원 계정 발급</h3>
     <form class="bar" id="uf">
       <div><label>아이디 (영문 소문자·숫자)</label><input name="id" pattern="[a-z0-9._-]{3,20}" required placeholder="예: kim01"></div>
-      <div><label>이름</label><input name="name" required></div>
+      <div><label>이름 (담당자명)</label><input name="name" list="pnames" required>
+        <datalist id="pnames">${pendings.map(p => `<option value="${esc(p.name)}">`).join("")}</datalist></div>
       <div><label>임시 비밀번호 (6자 이상)</label><input name="pw" minlength="6" required></div>
-      <div><label>권한</label><select name="role"><option value="sales">영업사원</option><option value="admin">관리자</option></select></div>
+      <div><label>권한</label><select name="role">${roleOpts}</select></div>
       <button class="btn">계정 만들기</button>
     </form>
+    <div class="muted">'담당자 이관 중'인 회원이 있으면, 이름·아이디가 똑같이 일치할 때 자동으로 이 계정에 넘어갑니다.${isSuper() ? "" : " (일반 관리자는 영업사원 계정만 만들 수 있습니다.)"}</div>
     <div class="err" id="uerr"></div>
     <h3 style="margin:18px 0 8px">사원 목록</h3>
     <div class="tblwrap"><table><thead><tr><th>이름</th><th>아이디</th><th>권한</th><th>상태</th><th></th></tr></thead>
-    <tbody>${users.map(u => `<tr><td>${esc(u.name)}</td><td>${esc(u.loginId)}</td><td>${u.role === "admin" ? "관리자" : "영업사원"}</td>
+    <tbody>${users.map(u => `<tr><td>${esc(u.name)}</td><td>${esc(u.loginId)}</td>
+      <td>${isSuper() && u.uid !== me.uid ? `<select data-role="${u.uid}" style="width:auto;padding:4px 6px">${["sales", "admin", "super"].map(r => `<option value="${r}" ${u.role === r ? "selected" : ""}>${roleLabel(r)}</option>`).join("")}</select>` : roleLabel(u.role)}</td>
       <td><span class="tag ${u.active ? "ok" : "off"}">${u.active ? "사용중" : "중지"}</span></td>
-      <td>${u.uid === me.uid ? `<span class="muted">본인</span>` : `<button class="btn ghost sm" data-uid="${u.uid}" data-act="${u.active ? 0 : 1}">${u.active ? "사용 중지" : "다시 사용"}</button>`}</td></tr>`).join("")}</tbody></table></div>
+      <td>${manage(u) ? `<button class="btn ghost sm" data-ren="${u.uid}">이름 변경</button> ` : ""}<button class="btn ghost sm" data-tr="${u.uid}">회원 이관</button>
+      ${u.uid === me.uid ? `<span class="muted">본인</span>` : manage(u) ? `<button class="btn ghost sm" data-uid="${u.uid}" data-act="${u.active ? 0 : 1}">${u.active ? "사용 중지" : "다시 사용"}</button>` : ""}</td></tr>`).join("")}</tbody></table></div>
+    ${pendings.length ? `<h3 style="margin:22px 0 8px">미가입 담당자 (엑셀로 올렸지만 아직 계정이 없음)</h3>
+    <div class="tblwrap"><table><thead><tr><th>이름</th><th></th></tr></thead>
+    <tbody>${pendings.map(p => `<tr><td>${esc(p.name)}</td><td><button class="btn ghost sm" data-trp="${esc(p.name)}">회원 이관</button> <button class="btn ghost sm" data-pen="${esc(p.id)}">이름 변경</button></td></tr>`).join("")}</tbody></table></div>` : ""}
+    ${transfers.length ? `<h3 style="margin:22px 0 8px">담당자 이관 중 (대상 계정이 아직 없음)</h3>
+    <div class="tblwrap"><table><thead><tr><th>대상 이름</th><th>대상 아이디</th><th class="n">회원 수</th><th>현재 담당자</th><th></th></tr></thead>
+    <tbody>${transfers.map(t => `<tr><td>${esc(t.name)}</td><td>${esc(t.loginId)}</td><td class="n">${t.count}</td><td>${[...t.froms].map(f => esc(nameOf(f))).join(", ")}</td>
+      <td><button class="btn ghost sm" data-tcx="${esc(t.loginId)}">이관 취소</button></td></tr>`).join("")}</tbody></table></div>
+    <p class="muted">위 이름·아이디와 똑같이 계정을 만들면 회원이 자동으로 넘어갑니다.</p>` : ""}
     <p class="muted">사용 중지된 계정은 로그인할 수 없으며, 입력했던 데이터는 그대로 보관됩니다. 비밀번호를 잊은 사원은 새 아이디를 발급하고 기존 계정을 중지하세요.</p></div>`;
 
   $("#uf").onsubmit = async ev => {
     ev.preventDefault(); $("#uerr").textContent = "";
-    const f = ev.target, id = f.id.value.trim().toLowerCase();
+    const f = ev.target, id = f.id.value.trim().toLowerCase(), name = f.name.value.trim().replace(/\s+/g, " ");
+    const role = isSuper() ? f.role.value : "sales";
     if (users.some(u => u.loginId === id)) { $("#uerr").textContent = "이미 사용 중인 아이디입니다."; return; }
+    if (users.some(u => nk(u.name) === nk(name))) { $("#uerr").textContent = "같은 이름의 사원이 이미 있습니다."; return; }
+    const bad = transfers.find(t => t.loginId === id && nk(t.name) !== nk(name));
+    if (bad) { $("#uerr").textContent = `이 아이디로 이관 대기 중인 이름은 '${bad.name}'입니다. 이름을 맞춰 주세요.`; return; }
     // 관리자 로그인 상태를 유지하기 위해 별도의 앱 인스턴스로 계정을 만든다.
     const sec = initializeApp(firebaseConfig, "secondary-" + Date.now());
     const secAuth = getAuth(sec);
     try {
       const cred = await createUserWithEmailAndPassword(secAuth, emailOf(id), f.pw.value);
       await signOut(secAuth);
-      await setDoc(doc(db, "users", cred.user.uid), {
-        loginId: id, name: f.name.value.trim(), role: f.role.value, active: true, createdAt: serverTimestamp()
-      });
-      toast(`'${id}' 계정이 만들어졌습니다.`);
+      await setDoc(doc(db, "users", cred.user.uid), { loginId: id, name, role, active: true, createdAt: serverTimestamp() });
+      let n = await completeTransfers(cred.user.uid, id, name);
+      if (pendings.some(p => nk(p.name) === nk(name)) && confirm(`엑셀로 올려 둔 미가입 담당자 '${name}'의 회원도 이 계정으로 옮길까요?\n(이름만 같은 다른 사람이면 [취소])`)) n += await linkPendingFor(cred.user.uid, name);
+      toast(n ? `'${id}' 계정을 만들고, 회원 ${n}건을 이관했습니다.` : `'${id}' 계정이 만들어졌습니다.`);
       await loadUsers(); renderUsers();
     } catch (er) { console.error(er); $("#uerr").textContent = authMsg(er); }
   };
-  $("#view").querySelector("tbody").onclick = async e => {
-    const b = e.target.closest("button[data-uid]"); if (!b) return;
-    const active = b.dataset.act === "1";
-    if (!active && !confirm("이 사원의 로그인을 중지할까요?")) return;
-    try { await updateDoc(doc(db, "users", b.dataset.uid), { active }); await loadUsers(); renderUsers(); toast("변경되었습니다."); }
-    catch (er) { toast("실패: " + (er.code || er.message)); }
+  $("#view").onclick = async e => {
+    if (tab !== "users") return;
+    const b = e.target.closest("button"); if (!b) return;
+    if (b.dataset.ren) return renameUser(b.dataset.ren);
+    if (b.dataset.pen) return renamePending(b.dataset.pen);
+    if (b.dataset.tr) return transferOwner(b.dataset.tr);
+    if (b.dataset.trp) return transferOwner(PEND + b.dataset.trp);
+    if (b.dataset.tcx) return cancelTransfer(b.dataset.tcx);
+    if (b.dataset.uid) {
+      const active = b.dataset.act === "1";
+      if (!active && !confirm("이 사원의 로그인을 중지할까요?")) return;
+      try { await updateDoc(doc(db, "users", b.dataset.uid), { active }); await loadUsers(); renderUsers(); toast("변경되었습니다."); }
+      catch (er) { toast("실패: " + (er.code || er.message)); }
+    }
+  };
+  $("#view").onchange = async e => {
+    if (tab !== "users") return;
+    const s = e.target.closest("select[data-role]"); if (!s) return;
+    if (!confirm(`권한을 '${roleLabel(s.value)}'(으)로 바꿀까요?`)) { renderUsers(); return; }
+    try { await updateDoc(doc(db, "users", s.dataset.role), { role: s.value }); await loadUsers(); renderUsers(); toast("권한을 변경했습니다."); }
+    catch (er) { toast("실패: " + (er.code || er.message)); renderUsers(); }
+  };
+}
+
+/* ---------- DB 출처 설정 (슈퍼 관리자) ---------- */
+let draft = null;
+function renderSettings() {
+  if (!isSuper()) { $("#view").innerHTML = `<div class="card">슈퍼 관리자만 사용할 수 있습니다.</div>`; return; }
+  if (!draft) draft = { realtime: [...settings.realtime], old: [...settings.old] };
+  const panel = (key, title, desc) => `<div class="card" style="flex:1;min-width:280px;margin:0;border:1px solid var(--line);box-shadow:none">
+    <h3 style="margin:0 0 4px">${title}</h3><p class="muted" style="margin:0 0 10px">${desc}</p>
+    <div class="chips">${draft[key].map((n, i) => `<span class="chip">${esc(n)}<button data-rm="${key}:${i}" title="삭제">×</button></span>`).join("") || '<span class="muted">비어 있음</span>'}</div>
+    <div class="bar" style="margin:10px 0 0"><div class="grow"><input data-add="${key}" placeholder="DB 출처 이름 입력 후 Enter"></div><button class="btn ghost" data-addbtn="${key}">추가</button></div></div>`;
+  const names = [...new Set([...draft.realtime, ...draft.old])];
+  $("#view").innerHTML = `<div class="card">
+    <div style="display:flex;gap:14px;flex-wrap:wrap">
+      ${panel("realtime", "실시간 DB 출처", "상태가 '실시간'인 회원에게 선택할 수 있는 DB 출처")}
+      ${panel("old", "구디비 DB 출처", "상태가 '구디비'인 회원에게 선택할 수 있는 DB 출처")}
+    </div>
+    <h3 style="margin:20px 0 8px">입력창 콤보박스에 표시될 목록</h3>
+    <div class="tblwrap"><table style="max-width:420px"><thead><tr><th>DB 출처</th><th>실시간</th><th>구디비</th></tr></thead>
+      <tbody>${names.map(n => `<tr><td>${esc(n)}</td><td>${draft.realtime.includes(n) ? '<span class="tag ok">실시간</span>' : ""}</td><td>${draft.old.includes(n) ? '<span class="tag">구디비</span>' : ""}</td></tr>`).join("")}</tbody></table></div>
+    <div class="err" id="serr"></div>
+    <div class="actions"><button class="btn ghost" id="sreset">되돌리기</button><button class="btn" id="ssave">저장</button></div>
+    <p class="muted">같은 이름을 양쪽에 모두 넣을 수 있습니다(예: 급등). 이미 입력된 회원 데이터는 바뀌지 않으며, 앞으로 저장하는 회원부터 이 기준으로 검사합니다.</p></div>`;
+  const add = key => {
+    const inp = $(`input[data-add="${key}"]`), n = inp.value.trim().replace(/\s+/g, " ");
+    if (!n) return;
+    if (n.includes(",")) { $("#serr").textContent = "이름에 쉼표(,)는 쓸 수 없습니다."; return; }
+    if (!draft[key].includes(n)) draft[key].push(n);
+    renderSettings(); $(`input[data-add="${key}"]`).focus();
+  };
+  $("#view").querySelectorAll("input[data-add]").forEach(i => i.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); add(i.dataset.add); } });
+  $("#view").querySelectorAll("button[data-addbtn]").forEach(b => b.onclick = () => add(b.dataset.addbtn));
+  $("#view").querySelectorAll("button[data-rm]").forEach(b => b.onclick = () => { const [k, i] = b.dataset.rm.split(":"); draft[k].splice(+i, 1); renderSettings(); });
+  $("#sreset").onclick = () => { draft = null; renderSettings(); };
+  $("#ssave").onclick = async () => {
+    if (!draft.realtime.length) { $("#serr").textContent = "실시간 DB 출처는 최소 1개 이상 필요합니다."; return; }
+    try {
+      await setDoc(doc(db, "settings", "db"), { realtime: draft.realtime, old: draft.old, updatedAt: serverTimestamp(), updatedBy: me.uid });
+      settings = { realtime: [...draft.realtime], old: [...draft.old] };
+      toast("DB 출처 설정을 저장했습니다.");
+    } catch (er) { console.error(er); $("#serr").textContent = "저장 실패: " + (er.code || er.message); }
   };
 }
 
@@ -403,12 +818,13 @@ function loadXlsxLib() {
     document.head.appendChild(s);
   });
 }
-const norm = s => String(s ?? "").replace(/\s/g, "").toLowerCase();
+const normH = s => String(s ?? "").replace(/\s/g, "").toLowerCase();
 const HEADER_ALIASES = {
-  date: ["신규날짜", "날짜"], callCount: ["콜량"], callTime: ["콜시간"], name: ["회원명", "이름"],
+  date: ["입금날짜", "신규날짜", "날짜"], callCount: ["콜량"], callTime: ["콜시간"], name: ["회원명", "이름"],
   phone: ["전화번호", "연락처", "휴대폰"], dbSource: ["db출처", "db"], status: ["상태"], contractType: ["계약분류"],
-  grade: ["등급분류", "등급"], newAmount: ["신규금액"], upsellNote: ["업셀여부", "업셀"], upsellDate: ["업셀날짜"],
-  upsellAmount: ["업셀금액"], period: ["계약기간"], voucher: ["무료바우처"], note: ["비고"]
+  grade: ["등급분류", "등급"], amount: ["계약금액", "신규금액"], period: ["계약기간"], voucher: ["무료바우처"],
+  upsellNote: ["업셀여부"], note: ["비고"],
+  upsellDate: ["업셀날짜"], upsellAmount: ["업셀금액"]       // 예전 양식(업셀을 같은 행에 적던 시트) 호환
 };
 const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 function cellDate(v, refYear) {
@@ -423,35 +839,40 @@ function parseSheet(wb, sheetName, refYear) {
   const ws = wb.Sheets[sheetName];
   const raw = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "", blankrows: false });
   const txt = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "", blankrows: false });
-  const hi = raw.slice(0, 15).findIndex(r => r.some(c => norm(c) === "회원명"));
+  const hi = raw.slice(0, 15).findIndex(r => r.some(c => normH(c) === "회원명"));
   if (hi < 0) return { error: "'회원명' 열이 있는 머리글 행을 찾지 못했습니다. 회원 목록 시트를 선택해 주세요." };
   const col = {};
-  raw[hi].forEach((h, i) => { for (const [k, al] of Object.entries(HEADER_ALIASES)) if (col[k] === undefined && al.includes(norm(h))) col[k] = i; });
+  raw[hi].forEach((h, i) => { for (const [k, al] of Object.entries(HEADER_ALIASES)) if (col[k] === undefined && al.includes(normH(h))) col[k] = i; });
   const rows = [];
   for (let r = hi + 1; r < raw.length; r++) {
     const g = k => col[k] === undefined ? "" : raw[r][col[k]];
     const t = k => col[k] === undefined ? "" : String(txt[r]?.[col[k]] ?? "").trim();
     const name = String(g("name") ?? "").trim();
     if (!name && !t("phone")) continue;
-    let phone = t("phone"); const dg = phone.replace(/\D/g, "");
+    let phone = t("phone"); const dg = digits(phone);
     phone = (dg.length === 10 && dg.startsWith("10")) ? fmtPhone("0" + dg) : fmtPhone(phone);
     const grades = String(g("grade")).split(/[,，/]/).map(x => x.trim()).filter(Boolean);
-    rows.push({
+    const base = {
       line: r + 1, name, phone, date: cellDate(g("date"), refYear),
-      dbSource: t("dbSource"), status: t("status"), contractType: t("contractType"),
-      grades, grade: grades.join(", "), newAmount: toNum(g("newAmount")), period: t("period"),
-      upsellNote: String(g("upsellNote") ?? "").trim(), upsellDate: cellDate(g("upsellDate"), refYear), upsellAmount: toNum(g("upsellAmount")),
-      voucher: t("voucher"), note: String(g("note") ?? "").trim(),
-      callCount: g("callCount") === "" ? null : toNum(g("callCount")), callTime: t("callTime")
-    });
+      dbSource: t("dbSource"), status: t("status"), contractType: t("contractType") || "신규",
+      grades, grade: grades.join(", "), amount: toNum(g("amount")), period: t("period"), voucher: t("voucher"),
+      upsellNote: String(g("upsellNote") ?? "").trim(), note: String(g("note") ?? "").trim(),
+      callCount: g("callCount") === "" ? null : toNum(g("callCount")), callTime: g("callTime") === "" ? null : toNum(g("callTime"))
+    };
+    rows.push(base);
+    // 예전 양식: 같은 행에 업셀 날짜·금액이 있으면 '업셀' 행을 하나 더 만든다.
+    const upAmt = toNum(g("upsellAmount"));
+    if (col.upsellAmount !== undefined && upAmt) {
+      rows.push({ ...base, contractType: "업셀", date: cellDate(g("upsellDate"), refYear), amount: upAmt, period: "", voucher: "", upsellNote: "", note: "", callCount: null, callTime: null });
+    }
   }
   return { rows };
 }
 
 function openImport() {
-  const sales = users.filter(u => u.active);
   const ownerSel = isAdmin()
-    ? `<div><label>저장할 담당자 *</label><select id="xowner">${sales.map(u => `<option value="${u.uid}" ${u.uid === (filterUid || me.uid) ? "selected" : ""}>${esc(u.name)}</option>`).join("")}</select></div>` : "";
+    ? `<div><label>담당자 * (파일명으로 자동 입력)</label><input id="xowner" list="xownerlist" placeholder="예: 최세영" autocomplete="off">
+        <datalist id="xownerlist">${[...users.map(u => u.name), ...pendings.map(p => p.name)].map(n => `<option value="${esc(n)}">`).join("")}</datalist></div>` : "";
   $("#modalRoot").innerHTML = `<div class="modal"><div class="box" style="max-width:1000px">
     <h2>엑셀에서 회원 가져오기</h2>
     <div class="bar">
@@ -460,36 +881,59 @@ function openImport() {
       ${ownerSel}
       <div><label>날짜가 비어 있는 행에 넣을 날짜</label><input type="date" id="xdef" value="${todayStr()}"></div>
     </div>
-    <p class="muted" style="margin:0 0 8px">머리글(회원명, 전화번호, 신규 금액 등)은 기존 시트 양식과 같아야 합니다. 같은 전화번호·날짜의 회원이 이미 있으면 '중복'으로 표시되고 기본적으로 제외됩니다.</p>
+    <p class="muted" style="margin:0 0 8px">머리글(입금 날짜, 회원명, 전화번호, 계약 금액 등)은 전용시트 양식과 같아야 합니다. 같은 전화번호·날짜·분류·금액의 회원이 이미 있으면 '중복'으로 제외되고, 실시간/구디비와 DB 출처가 맞지 않는 행은 '오류'로 표시됩니다.</p>
+    <div id="xhint" class="muted" style="margin-bottom:8px"></div>
     <div id="xprev"></div>
     <div class="err" id="xerr"></div>
     <div class="actions"><button type="button" class="btn ghost" id="xcancel">닫기</button><button type="button" class="btn" id="xgo" disabled>선택한 행 저장</button></div>
   </div></div>`;
   let wb = null, parsed = [], existing = new Map(), seq = 0;
-  const ownerUid = () => isAdmin() ? $("#xowner").value : me.uid;
+  const ownerName = () => isAdmin() ? ($("#xowner").value || "").trim().replace(/\s+/g, " ") : me.name;
+  const ownerUid = () => {
+    if (!isAdmin()) return me.uid;
+    const n = ownerName(); if (!n) return "";
+    const u = users.find(x => nk(x.name) === nk(n));
+    return u ? u.uid : PEND + n;
+  };
+  const updateHint = () => {
+    if (!isAdmin()) return;
+    const n = ownerName(), u = n && users.find(x => nk(x.name) === nk(n));
+    $("#xhint").innerHTML = !n ? "" : u
+      ? `→ 기존 사원 <b>${esc(u.name)}</b> (아이디 ${esc(u.loginId)})의 회원으로 저장됩니다.`
+      : `→ 아직 계정이 없는 담당자입니다. <b>${esc(n)}</b> 이름으로 저장해 두고, 이후 '회원 이관'으로 옮기거나 같은 이름으로 계정을 만들 때 연결할 수 있습니다.`;
+  };
+  const guessOwner = fname => {
+    const base = fname.replace(/\.[^.]+$/, "").trim();
+    const hit = [...users.map(u => u.name), ...pendings.map(p => p.name)].filter(Boolean).sort((a, b) => b.length - a.length).find(n => nk(base).includes(nk(n)));
+    return hit || base;
+  };
   $("#xcancel").onclick = closeModal;
+  const keyOf = (phone, name, date, type, amount) => `${digits(phone) || name}|${date}|${type || "신규"}|${amount || 0}`;
 
   async function ensureExisting(months) {
     const uid = ownerUid();
     await Promise.all([...months].filter(m => !existing.has(`${uid}|${m}`)).map(async m => {
       const s = await getDocs(query(collection(db, "contracts"), where("ownerUid", "==", uid), where("ym", "==", m)));
-      existing.set(`${uid}|${m}`, new Set(s.docs.map(d => keyOf(d.data().phone, d.data().name, d.data().date))));
+      existing.set(`${uid}|${m}`, new Set(s.docs.map(d => { const v = d.data(); return keyOf(v.phone, v.name, v.date, v.contractType, v.amount); })));
     }));
   }
-  const keyOf = (phone, name, date) => `${String(phone).replace(/\D/g, "") || name}|${date}`;
-
   async function refreshPreview() {
     const my = ++seq, def = $("#xdef").value, uid = ownerUid();
     if (!parsed.length) return;
+    $("#xerr").textContent = "";
+    if (!uid) { $("#xerr").textContent = "담당자 이름을 입력하세요."; parsed.forEach(r => { r.st = "err"; r.msg = "담당자 없음"; r.use = false; }); drawPreview(); return; }
     parsed.forEach(r => r.finalDate = r.date || def);
     const months = new Set(parsed.map(r => (r.finalDate || "").slice(0, 7)).filter(m => /^\d{4}-\d{2}$/.test(m)));
     try { await ensureExisting(months); } catch (e) { $("#xerr").textContent = "기존 데이터 확인 실패: " + (e.code || e.message); }
     if (my !== seq) return;
     const seen = new Set();
     parsed.forEach(r => {
+      r.tip = "";
       if (!r.name) { r.st = "err"; r.msg = "회원명 없음"; return; }
       if (!/^\d{4}-\d{2}-\d{2}$/.test(r.finalDate || "")) { r.st = "err"; r.msg = "날짜 없음"; return; }
-      const k = keyOf(r.phone, r.name, r.finalDate);
+      const bad = checkSource(r.status, r.dbSource);
+      if (bad) { r.st = "err"; r.msg = `${r.status}·${r.dbSource || "-"} 불일치`; r.tip = bad; return; }
+      const k = keyOf(r.phone, r.name, r.finalDate, r.contractType, r.amount);
       if (existing.get(`${uid}|${r.finalDate.slice(0, 7)}`)?.has(k)) { r.st = "dup"; r.msg = "이미 등록됨"; return; }
       if (seen.has(k)) { r.st = "dup"; r.msg = "파일 내 중복"; return; }
       seen.add(k); r.st = "ok"; r.msg = r.date ? "" : "날짜 자동 입력";
@@ -500,11 +944,11 @@ function openImport() {
   function drawPreview() {
     const n = parsed.filter(r => r.use && r.st !== "err").length;
     $("#xprev").innerHTML = `<div class="muted" style="margin-bottom:6px">총 ${parsed.length}행 · 신규 ${parsed.filter(r => r.st === "ok").length} · 중복 ${parsed.filter(r => r.st === "dup").length} · 오류 ${parsed.filter(r => r.st === "err").length}</div>
-      <div class="tblwrap" style="max-height:340px;overflow:auto"><table><thead><tr><th>저장</th><th>상태</th><th>날짜</th><th>회원명</th><th>전화번호</th><th>DB</th><th>구분</th><th>등급</th><th class="n">신규 금액</th><th>업셀 날짜</th><th class="n">업셀 금액</th><th>콜량</th></tr></thead><tbody>
-      ${parsed.map((r, i) => `<tr><td><input type="checkbox" data-i="${i}" style="width:auto" ${r.use ? "checked" : ""} ${r.st === "err" ? "disabled" : ""}></td>
-        <td><span class="tag ${r.st === "ok" ? "ok" : "off"}">${r.st === "ok" ? "신규" : r.st === "dup" ? "중복" : "오류"}</span> <span class="muted">${esc(r.msg)}</span></td>
-        <td>${esc(r.finalDate)}</td><td>${esc(r.name)}</td><td>${esc(r.phone)}</td><td>${esc(r.dbSource)}</td><td>${esc(r.status)}</td><td>${esc(r.grade)}</td>
-        <td class="n">${won(r.newAmount)}</td><td>${esc(r.upsellDate)}</td><td class="n">${r.upsellAmount ? won(r.upsellAmount) : ""}</td><td>${r.callCount ?? ""}</td></tr>`).join("")}
+      <div class="tblwrap" style="max-height:340px;overflow:auto"><table><thead><tr><th>저장</th><th>상태</th><th>입금 날짜</th><th>회원명</th><th>전화번호</th><th>DB</th><th>상태</th><th>분류</th><th>등급</th><th class="n">계약 금액</th><th>콜량</th><th>콜 시간</th></tr></thead><tbody>
+      ${parsed.map((r, i) => `<tr class="${r.amount < 0 ? "refund" : ""}"><td><input type="checkbox" data-i="${i}" style="width:auto" ${r.use ? "checked" : ""} ${r.st === "err" ? "disabled" : ""}></td>
+        <td title="${esc(r.tip)}"><span class="tag ${r.st === "ok" ? "ok" : "off"}">${r.st === "ok" ? "신규" : r.st === "dup" ? "중복" : "오류"}</span> <span class="muted">${esc(r.msg)}</span></td>
+        <td>${esc(r.finalDate)}</td><td>${esc(r.name)}</td><td>${esc(r.phone)}</td><td>${esc(r.dbSource)}</td><td>${esc(r.status)}</td><td>${esc(r.contractType)}</td><td>${esc(r.grade)}</td>
+        <td class="n">${won(r.amount)}</td><td>${r.callCount ?? ""}</td><td>${r.callTime ?? ""}</td></tr>`).join("")}
       </tbody></table></div>`;
     $("#xgo").disabled = n === 0; $("#xgo").textContent = `선택한 ${n}건 저장`;
     $("#xprev").querySelectorAll("input[data-i]").forEach(cb => cb.onchange = () => { parsed[+cb.dataset.i].use = cb.checked; drawPreview(); });
@@ -521,10 +965,10 @@ function openImport() {
     const f = e.target.files[0]; if (!f) return;
     try {
       await loadXlsxLib();
+      if (isAdmin()) { $("#xowner").value = guessOwner(f.name); updateHint(); }
       wb = XLSX.read(await f.arrayBuffer(), { type: "array", cellDates: true });
       $("#xsheet").innerHTML = wb.SheetNames.map(n => `<option>${esc(n)}</option>`).join("");
-      // '회원명' 머리글이 있는 시트를 우선 선택
-      const best = wb.SheetNames.find(n => XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: "" }).slice(0, 15).some(r => r.some(c => norm(c) === "회원명")));
+      const best = wb.SheetNames.find(n => XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: "" }).slice(0, 15).some(r => r.some(c => normH(c) === "회원명")));
       if (best) $("#xsheet").value = best;
       $("#xsheetWrap").classList.toggle("hidden", wb.SheetNames.length < 2);
       readSheet();
@@ -532,7 +976,7 @@ function openImport() {
   };
   $("#xsheet").onchange = readSheet;
   $("#xdef").onchange = () => { parsed.forEach(r => { r.use = undefined; }); refreshPreview(); };
-  if (isAdmin()) $("#xowner").onchange = () => { parsed.forEach(r => { r.use = undefined; }); refreshPreview(); };
+  if (isAdmin()) { $("#xowner").oninput = updateHint; $("#xowner").onchange = () => { updateHint(); parsed.forEach(r => { r.use = undefined; }); refreshPreview(); }; }
 
   $("#xgo").onclick = async () => {
     const uid = ownerUid(), todo = parsed.filter(r => r.use && r.st !== "err");
@@ -540,26 +984,24 @@ function openImport() {
     $("#xgo").disabled = true; $("#xerr").textContent = "";
     try {
       const ops = [];
+      if (uid.startsWith(PEND)) { const nm = uid.slice(PEND.length); ops.push(b => b.set(doc(db, "pending", pendId(nm)), { name: nm, createdAt: serverTimestamp() }, { merge: true })); }
       todo.forEach(r => {
         const data = {
-          ownerUid: uid, date: r.finalDate, ym: r.finalDate.slice(0, 7), name: r.name, phone: r.phone,
+          ownerUid: uid, date: r.finalDate, ym: r.finalDate.slice(0, 7), name: r.name, phone: r.phone, phoneKey: digits(r.phone),
           dbSource: r.dbSource, status: r.status, contractType: r.contractType, grades: r.grades, grade: r.grade,
-          newAmount: r.newAmount, period: r.period, upsellNote: r.upsellNote, upsellDate: r.upsellDate,
-          upYm: r.upsellDate ? r.upsellDate.slice(0, 7) : "", upsellAmount: r.upsellAmount,
-          voucher: r.voucher, note: r.note, createdAt: serverTimestamp(), updatedAt: serverTimestamp()
+          amount: r.amount, period: r.period, voucher: r.voucher, upsellNote: r.upsellNote, note: r.note,
+          createdAt: serverTimestamp(), updatedAt: serverTimestamp()
         };
         ops.push(b => b.set(doc(collection(db, "contracts")), data));
       });
-      // 일별 콜량/콜시간 (날짜별로 마지막 값 사용)
+      // 일별 콜량/콜 시간 (날짜별로 마지막 값 사용)
       const dmap = new Map();
-      todo.forEach(r => { if (r.callCount !== null || r.callTime) { const o = dmap.get(r.finalDate) || {}; if (r.callCount !== null) o.callCount = r.callCount; if (r.callTime) o.callTime = r.callTime; dmap.set(r.finalDate, o); } });
+      todo.forEach(r => { if (r.callCount !== null || r.callTime !== null) { const o = dmap.get(r.finalDate) || {}; if (r.callCount !== null) o.callCount = r.callCount; if (r.callTime !== null) o.callTime = r.callTime; dmap.set(r.finalDate, o); } });
       dmap.forEach((o, date) => ops.push(b => b.set(doc(db, "daily", `${uid}_${date}`), { ownerUid: uid, date, ym: date.slice(0, 7), ...o, updatedAt: serverTimestamp() }, { merge: true })));
-      for (let i = 0; i < ops.length; i += 200) {
-        const b = writeBatch(db); ops.slice(i, i + 200).forEach(f => f(b)); await b.commit();
-      }
+      await commitOps(ops);
       closeModal(); toast(`${todo.length}건을 저장했습니다.`);
       const first = todo.map(r => r.finalDate).sort()[0];
-      ym = first.slice(0, 7); if (isAdmin()) filterUid = uid;
+      ym = first.slice(0, 7); if (isAdmin()) { filterUid = uid; await loadUsers(); }
       await loadMonth(); render();
     } catch (er) { console.error(er); $("#xerr").textContent = "저장 실패: " + (er.code || er.message); $("#xgo").disabled = false; }
   };

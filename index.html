@@ -53,6 +53,23 @@ tfoot td{font-weight:700;background:#f8f9fc}
 .sum{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
 .sum div{background:#f8f9fc;border-radius:10px;padding:8px 14px}
 .sum b{display:block;font-size:17px}
+.tag.warn{background:#fff4e5;color:var(--warn)}
+tr.refund{background:#fdecec}
+tr.refund:hover,tbody tr.refund.click:hover{background:#fadada}
+tr.today td{background:#fffbe6}
+td.sel{user-select:none;width:34px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:4px;background:#eef2ff;color:var(--pri);border-radius:99px;padding:3px 6px 3px 12px;font-size:14px}
+.chip button{border:0;background:transparent;color:var(--pri);font-size:16px;line-height:1;padding:0 4px;border-radius:50%}
+.chip button:hover{background:#d9e1ff}
+.vhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px;gap:10px;flex-wrap:wrap}
+.vrow{display:flex;gap:10px;align-items:stretch}
+.vnav{width:46px;font-size:24px;border:1px solid var(--line);background:#fff;border-radius:10px;color:var(--pri);font-weight:700}
+.vnav:hover:not(:disabled){background:#eef2ff}
+.vnav:disabled{opacity:.3;cursor:default}
+.vcard{flex:1;margin:0;display:grid;grid-template-columns:100px 1fr;gap:6px 12px;align-content:start}
+.vcard dt{color:var(--sub);font-size:13px;padding-top:2px}
+.vcard dd{margin:0;white-space:pre-wrap;word-break:break-all}
 /* modal */
 .modal{position:fixed;inset:0;background:rgba(15,20,35,.45);display:flex;align-items:flex-start;justify-content:center;padding:20px 12px;overflow:auto;z-index:20}
 .modal .box{background:#fff;border-radius:14px;width:100%;max-width:640px;padding:20px}
