@@ -49,6 +49,7 @@ let me = null;                 // {uid, name, role, loginId}  role: super | admi
 let tab = "list";
 let ym = todayStr().slice(0, 7);
 let filterUid = "";            // 관리자 사원 필터
+let loadedKey = "";           // 마지막으로 불러온 (월|사원) — 탭 이동 시 갱신 여부 판단
 let callUid = "";              // 일별 콜량 탭에서 관리자가 고른 사원
 let search = "";
 let contracts = [], dailies = [], users = [], pendings = [], transfers = [];
@@ -69,6 +70,41 @@ const ownerOptions = sel => users.map(u => `<option value="${u.uid}" ${u.uid ===
 const amt = c => Number(c.amount) || 0;
 const isRefund = c => amt(c) < 0;
 const isUpsell = c => c.contractType === "업셀";
+
+/* ---------- 계약 기간 (시작일·종료일·무료 바우처) ---------- */
+const isDate = s => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || ""); if (!m) return false;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  return d.getUTCFullYear() === +m[1] && d.getUTCMonth() === +m[2] - 1 && d.getUTCDate() === +m[3];
+};
+// yyyy-mm-dd 에 일/주/개월/년을 더한다. (개월·년은 말일을 넘으면 그 달 말일로 맞춤)
+function addSpan(s, qty, unit) {
+  const [y, m, d] = s.split("-").map(Number);
+  let dt;
+  if (unit === "일" || unit === "주") dt = new Date(Date.UTC(y, m - 1, d + qty * (unit === "주" ? 7 : 1)));
+  else {
+    const t = m - 1 + (unit === "년" ? qty * 12 : qty), yy = y + Math.floor(t / 12), mm = ((t % 12) + 12) % 12;
+    const dim = new Date(Date.UTC(yy, mm + 1, 0)).getUTCDate();
+    dt = new Date(Date.UTC(yy, mm, Math.min(d, dim)));
+  }
+  return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())}`;
+}
+// 시작일·종료일·바우처로 최종 종료일과 표기 문구를 만든다. 문제가 있으면 error.
+function buildPeriod(start, end, qty, unit) {
+  if (!start && !end) return qty ? { error: "무료 바우처를 반영하려면 계약 시작일과 종료일을 입력하세요." } : { period: "", endFinal: "" };
+  if (!isDate(start) || !isDate(end)) return { error: "계약 시작일과 종료일을 yyyy-mm-dd 형식(예: 2026-10-01)으로 모두 입력하세요." };
+  if (end < start) return { error: "계약 종료일이 시작일보다 빠를 수 없습니다." };
+  const endFinal = qty > 0 ? addSpan(end, qty, unit) : end;
+  return { endFinal, period: `${start} ~ ${endFinal}${qty > 0 ? " (무료 바우처 기간 포함)" : ""}` };
+}
+// 엑셀의 "26. 10. 1 ~ 26. 11. 1" 같은 문구를 yyyy-mm-dd 로 읽는다.
+function parsePeriodText(t) {
+  const m = /(\d{2,4})\s*[.\-/]\s*(\d{1,2})\s*[.\-/]\s*(\d{1,2})\s*~\s*(\d{2,4})\s*[.\-/]\s*(\d{1,2})\s*[.\-/]\s*(\d{1,2})/.exec(String(t || ""));
+  if (!m) return null;
+  const Y = v => String(v.length === 2 ? 2000 + +v : v);
+  const a = `${Y(m[1])}-${pad(+m[2])}-${pad(+m[3])}`, b = `${Y(m[4])}-${pad(+m[5])}-${pad(+m[6])}`;
+  return isDate(a) && isDate(b) ? { startDate: a, endDate: b, endFinal: b, period: `${a} ~ ${b}` } : null;
+}
 
 /* ---------- DB 출처 (실시간 / 구디비) ---------- */
 const allSources = () => [...new Set([...settings.realtime, ...settings.old])];
@@ -153,11 +189,13 @@ async function loadMonth() {
   ]);
   contracts = a.docs.map(d => ({ id: d.id, ...d.data() }));
   dailies = c.docs.map(d => ({ id: d.id, ...d.data() }));
+  loadedKey = `${ym}|${filterUid}`;
 }
 
 /* ---------- 탭 ---------- */
 function buildTabs() {
-  const items = [["list", "회원 목록·입력"], ["calls", "일별 콜량 입력"], ["stats", "일별 통계"]];
+  const items = [["list", "회원 목록·입력"], ["calls", "일별 콜량 입력"]];
+  if (isSuper()) items.push(["stats", "영업 데이터 통계"]);
   if (isAdmin()) items.push(["users", "사원 관리"]);
   if (isSuper()) items.push(["settings", "DB 출처 설정"]);
   $("#tabs").innerHTML = items.map(([k, l]) => `<button data-t="${k}" class="${k === tab ? "on" : ""}">${l}</button>`).join("");
@@ -165,6 +203,7 @@ function buildTabs() {
     const t = e.target.dataset.t; if (!t) return;
     tab = t; buildTabs();
     if (t === "users") await loadUsers();
+    if ((t === "list" || t === "calls") && loadedKey !== `${ym}|${filterUid}`) await loadMonth();
     if (t === "settings") { await loadSettings(); draft = null; }
     render();
   };
@@ -334,10 +373,16 @@ function openForm(c) {
       <div><label>계약 분류</label><select name="contractType">${opt(OPTIONS.contractType, e.contractType)}</select></div>
       <div class="full"><label>등급 분류 (복수 선택)</label><div class="chk">${[...new Set([...OPTIONS.grades, ...(e.grades || [])])].map(g => `<label><input type="checkbox" name="grades" value="${esc(g)}" ${(e.grades || []).includes(g) ? "checked" : ""}>${esc(g)}</label>`).join("")}</div></div>
       <div><label>계약 금액 (원) — 환불은 음수(-)로 입력</label><input name="amount" inputmode="numeric" value="${e.amount ? won(e.amount) : ""}"></div>
-      <div><label>계약 기간</label><input name="period" value="${esc(e.period)}" placeholder="예: 26. 10. 1 ~ 26. 11. 1"></div>
-      <div class="full" id="rhint" style="margin-top:-6px"></div>
-      <div><label>무료 바우처</label><input name="voucher" value="${esc(e.voucher)}"></div>
       <div><label>업셀 여부</label><input name="upsellNote" value="${esc(e.upsellNote)}" placeholder="자유 기재"></div>
+      <div class="full" id="rhint" style="margin-top:-6px"></div>
+      <div><label>계약 시작일 (yyyy-mm-dd)</label><input name="startDate" inputmode="numeric" maxlength="10" placeholder="2026-10-01" autocomplete="off" value="${esc(e.startDate)}"></div>
+      <div><label>계약 종료일 (yyyy-mm-dd)</label><input name="endDate" inputmode="numeric" maxlength="10" placeholder="2026-11-01" autocomplete="off" value="${esc(e.endDate)}"></div>
+      <div><label>무료 바우처 (수치 + 단위)</label>
+        <div style="display:flex;gap:8px"><input name="vqty" type="number" min="1" step="1" inputmode="numeric" placeholder="수치" value="${e.voucherQty || ""}" style="flex:1">
+        <select name="vunit" style="flex:1">${["일", "주", "개월", "년"].map(u => `<option ${u === (e.voucherUnit || "일") ? "selected" : ""}>${u}</option>`).join("")}</select></div></div>
+      <div id="phint" class="muted" style="align-self:end;padding-bottom:9px"></div>
+      ${c && c.period && !c.startDate ? `<div class="full muted">기존에 입력된 계약 기간: ${esc(c.period)} (시작일·종료일을 입력하면 바뀝니다)</div>` : ""}
+      ${c && c.voucher && !c.voucherQty ? `<div class="full muted">기존에 입력된 무료 바우처: ${esc(c.voucher)}</div>` : ""}
       <div class="full"><label>비고</label><textarea name="note">${esc(e.note)}</textarea></div>
     </div>
     <div class="err" id="cerr"></div>
@@ -349,6 +394,16 @@ function openForm(c) {
   f.amount.onblur = () => f.amount.value = f.amount.value ? won(toNum(f.amount.value)) : "";
   const hint = () => { $("#rhint").innerHTML = toNum(f.amount.value) < 0 ? '<span class="tag off">환불</span> <span class="muted">계약 금액이 0보다 작아 환불로 표시됩니다.</span>' : ""; };
   f.amount.oninput = hint; hint();
+  const phint = () => {
+    const r = buildPeriod(f.startDate.value.trim(), f.endDate.value.trim(), Math.floor(Number(f.vqty.value)) || 0, f.vunit.value);
+    $("#phint").innerHTML = r.error || !r.period ? "" : `계약 기간: <b>${esc(r.period)}</b>`;
+  };
+  [f.startDate, f.endDate].forEach(el => el.oninput = () => {
+    const d = el.value.replace(/\D/g, "").slice(0, 8);
+    el.value = d.length > 6 ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : d.length > 4 ? `${d.slice(0, 4)}-${d.slice(4)}` : d;
+    phint();
+  });
+  f.vqty.oninput = phint; f.vunit.onchange = phint; phint();
   const warn = () => { const m = checkSource(f.status.value, f.dbSource.value); if (m) alert(m); };
   f.dbSource.onchange = warn; f.status.onchange = warn;
   $("#ccancel").onclick = closeModal;
@@ -363,6 +418,9 @@ function openForm(c) {
     const bad = checkSource(v.get("status"), v.get("dbSource"));
     if (bad) { alert(bad); return; }
     const grades = v.getAll("grades");
+    const vqty = Math.floor(Number(v.get("vqty"))) || 0, vunit = v.get("vunit");
+    const per = buildPeriod(v.get("startDate").trim(), v.get("endDate").trim(), vqty, vunit);
+    if (per.error) { alert(per.error); return; }
     const date = v.get("date"), phone = fmtPhone(v.get("phone").trim());
     const data = {
       ownerUid: isAdmin() ? v.get("owner") : (c ? c.ownerUid : me.uid),
@@ -370,8 +428,12 @@ function openForm(c) {
       name: v.get("name").trim(), phone, phoneKey: digits(phone),
       dbSource: v.get("dbSource"), status: v.get("status"), contractType: v.get("contractType"),
       grades, grade: grades.join(", "),
-      amount: toNum(v.get("amount")), period: v.get("period").trim(),
-      voucher: v.get("voucher").trim(), upsellNote: v.get("upsellNote").trim(), note: v.get("note").trim(),
+      amount: toNum(v.get("amount")),
+      startDate: v.get("startDate").trim(), endDate: v.get("endDate").trim(), endFinal: per.endFinal,
+      period: per.period || (c && !c.startDate ? c.period || "" : ""),
+      voucherQty: vqty, voucherUnit: vqty ? vunit : "",
+      voucher: vqty ? `${vqty}${vunit}` : (c && !c.voucherQty ? c.voucher || "" : ""),
+      upsellNote: v.get("upsellNote").trim(), note: v.get("note").trim(),
       updatedAt: serverTimestamp()
     };
     if (isAdmin() && c && data.ownerUid !== c.ownerUid) { data.transferName = deleteField(); data.transferLoginId = deleteField(); }
@@ -448,56 +510,167 @@ async function renderCalls() {
   };
 }
 
-/* ---------- 일별 통계 ---------- */
-function renderStats() {
-  const [y, m] = ym.split("-").map(Number);
-  const last = new Date(y, m, 0).getDate();
-  const days = Array.from({ length: last }, (_, i) => `${ym}-${pad(i + 1)}`);
-  const tot = { live: 0, old: 0, all: 0, calls: 0, time: 0, nw: 0, up: 0, ref: 0 };
-  const lines = [];
-  const body = days.map(d => {
-    const on = contracts.filter(c => c.date === d);
-    const real = on.filter(c => !isRefund(c) && !isUpsell(c));          // 신규 계약만 건수에 포함
-    const live = real.filter(c => c.status === "실시간").length;
-    const old = real.filter(c => c.status === "구디비").length;
-    const dl = dailies.filter(x => x.date === d);
-    const calls = dl.reduce((s, x) => s + (x.callCount || 0), 0), time = dl.reduce((s, x) => s + (x.callTime || 0), 0);
-    const nw = on.filter(c => !isRefund(c) && !isUpsell(c)).reduce((s, c) => s + amt(c), 0);
-    const up = on.filter(c => !isRefund(c) && isUpsell(c)).reduce((s, c) => s + amt(c), 0);
-    const ref = on.filter(isRefund).reduce((s, c) => s + amt(c), 0);
-    tot.live += live; tot.old += old; tot.all += real.length; tot.calls += calls; tot.time += time; tot.nw += nw; tot.up += up; tot.ref += ref;
-    const v = [d.slice(5).replace("-", "/"), live, old, real.length, calls, time, nw, up, ref, nw + up + ref];
-    lines.push(v);
-    const z = x => x ? won(x) : "";
-    return `<tr><td>${v[0]}</td><td class="n">${live || ""}</td><td class="n">${old || ""}</td><td class="n">${real.length || ""}</td><td class="n">${z(calls)}</td><td class="n">${z(time)}</td><td class="n">${z(nw)}</td><td class="n">${z(up)}</td><td class="n" style="color:var(--red)">${z(ref)}</td><td class="n">${z(nw + up + ref)}</td></tr>`;
+/* ---------- 영업 데이터 통계 (슈퍼 관리자 전용) ---------- */
+const stx = { contracts: [], dailies: [], supply: new Map(), exec: [], uid: "" };
+async function loadStatsData() {
+  const [a, c, s, e] = await Promise.all([
+    getDocs(query(collection(db, "contracts"), where("ym", "==", ym))),
+    getDocs(query(collection(db, "daily"), where("ym", "==", ym))),
+    getDocs(query(collection(db, "dbSupply"), where("ym", "==", ym))),
+    getDoc(doc(db, "execStats", ym))
+  ]);
+  stx.contracts = a.docs.map(d => ({ id: d.id, ...d.data() }));
+  stx.dailies = c.docs.map(d => ({ id: d.id, ...d.data() }));
+  stx.supply = new Map(s.docs.map(d => [d.data().ownerUid, d.data().counts || {}]));
+  stx.exec = e.exists() ? (e.data().rows || []) : [];
+}
+async function renderStats() {
+  if (!isSuper()) { $("#view").innerHTML = `<div class="card">슈퍼 관리자만 볼 수 있습니다.</div>`; return; }
+  $("#view").innerHTML = `<div class="card muted">불러오는 중…</div>`;
+  try { await loadStatsData(); }
+  catch (er) { console.error(er); $("#view").innerHTML = `<div class="card err">통계를 불러오지 못했습니다: ${esc(er.code || er.message)}<br>(보안 규칙을 최신으로 게시했는지 확인하세요)</div>`; return; }
+  if (tab === "stats") drawStats();
+}
+function drawStats() {
+  const isNew = c => !isRefund(c) && !isUpsell(c);               // 건수·신규 매출은 '신규' 계약만
+  const ids = new Set(users.filter(u => u.role === "sales").map(u => u.uid));
+  [...stx.contracts, ...stx.dailies].forEach(x => ids.add(x.ownerUid));
+  stx.supply.forEach((_, k) => ids.add(k));
+  const owners = [...ids].map(uid => ({ uid, name: nameOf(uid) })).sort((a, b) => a.name.localeCompare(b.name, "ko"));
+  const sumOf = (arr, f) => arr.reduce((s, x) => s + f(x), 0);
+  const aggregate = list => {
+    const cs = stx.contracts.filter(c => list.has(c.ownerUid)), ds = stx.dailies.filter(d => list.has(d.ownerUid));
+    return {
+      live: cs.filter(c => isNew(c) && c.status === "실시간").length, old: cs.filter(c => isNew(c) && c.status === "구디비").length,
+      calls: sumOf(ds, d => d.callCount || 0), time: sumOf(ds, d => d.callTime || 0),
+      nw: sumOf(cs.filter(isNew), amt), up: sumOf(cs.filter(c => !isRefund(c) && isUpsell(c)), amt), ref: sumOf(cs.filter(isRefund), amt)
+    };
+  };
+  const supplyOf = uid => Object.values(stx.supply.get(uid) || {}).reduce((s, v) => s + (Number(v) || 0), 0);
+  const z = v => v ? won(v) : "";
+  const red = v => `<td class="n" style="color:var(--red)">${z(v)}</td>`;
+
+  /* ① 사원별 */
+  const tot = { sup: 0, live: 0, old: 0, calls: 0, time: 0, nw: 0, up: 0, ref: 0 };
+  const rowsA = owners.map(o => {
+    const a = aggregate(new Set([o.uid])), sup = supplyOf(o.uid);
+    Object.keys(tot).forEach(k => tot[k] += k === "sup" ? sup : a[k]);
+    return { o, a, sup };
+  });
+  const aCsv = [["담당자", "DB 총 공급수", "실시간 신규", "구디비 신규", "콜 수", "콜 시간(분)", "신규 매출", "업셀 금액", "환불 금액", "총합계"],
+    ...rowsA.map(r => [r.o.name, r.sup, r.a.live, r.a.old, r.a.calls, r.a.time, r.a.nw, r.a.up, r.a.ref, r.a.nw + r.a.up + r.a.ref]),
+    ["총계", tot.sup, tot.live, tot.old, tot.calls, tot.time, tot.nw, tot.up, tot.ref, tot.nw + tot.up + tot.ref]];
+
+  /* ② 날짜별 (전체 또는 한 사원) */
+  const sel = stx.uid && owners.some(o => o.uid === stx.uid) ? new Set([stx.uid]) : new Set(owners.map(o => o.uid));
+  const [y, m] = ym.split("-").map(Number), last = new Date(y, m, 0).getDate();
+  const dt = { live: 0, old: 0, calls: 0, time: 0, nw: 0, up: 0, ref: 0 };
+  const bCsv = [["날짜", "실시간 수", "구디비 수", "콜량", "콜시간(분)", "신규 금액", "업셀 금액", "환불 금액", "총합계"]];
+  const bodyB = Array.from({ length: last }, (_, i) => {
+    const d = `${ym}-${pad(i + 1)}`;
+    const cs = stx.contracts.filter(c => c.date === d && sel.has(c.ownerUid)), ds = stx.dailies.filter(x => x.date === d && sel.has(x.ownerUid));
+    const v = {
+      live: cs.filter(c => isNew(c) && c.status === "실시간").length, old: cs.filter(c => isNew(c) && c.status === "구디비").length,
+      calls: sumOf(ds, x => x.callCount || 0), time: sumOf(ds, x => x.callTime || 0),
+      nw: sumOf(cs.filter(isNew), amt), up: sumOf(cs.filter(c => !isRefund(c) && isUpsell(c)), amt), ref: sumOf(cs.filter(isRefund), amt)
+    };
+    Object.keys(dt).forEach(k => dt[k] += v[k]);
+    bCsv.push([d, v.live, v.old, v.calls, v.time, v.nw, v.up, v.ref, v.nw + v.up + v.ref]);
+    return `<tr><td>${d.slice(5).replace("-", "/")}</td><td class="n">${v.live || ""}</td><td class="n">${v.old || ""}</td><td class="n">${z(v.calls)}</td><td class="n">${z(v.time)}</td><td class="n">${z(v.nw)}</td><td class="n">${z(v.up)}</td>${red(v.ref)}<td class="n">${z(v.nw + v.up + v.ref)}</td></tr>`;
   }).join("");
 
-  let perUser = "";
-  if (isAdmin() && !filterUid) {
-    const owners = [...users.map(u => ({ uid: u.uid, name: u.name })), ...pendings.map(x => ({ uid: PEND + x.name, name: x.name + " (미가입)" }))];
-    const rows = owners.map(u => {
-      const mine = contracts.filter(c => c.ownerUid === u.uid);
-      const real = mine.filter(c => !isRefund(c) && !isUpsell(c));
-      const nw = real.reduce((s, c) => s + amt(c), 0);
-      const up = mine.filter(c => !isRefund(c) && isUpsell(c)).reduce((s, c) => s + amt(c), 0);
-      const ref = mine.filter(isRefund).reduce((s, c) => s + amt(c), 0);
-      const dl = dailies.filter(x => x.ownerUid === u.uid);
-      return { u, cnt: real.length, calls: dl.reduce((s, x) => s + (x.callCount || 0), 0), time: dl.reduce((s, x) => s + (x.callTime || 0), 0), nw, up, ref };
-    });
-    perUser = `<h3 style="margin:22px 0 8px">사원별 합계</h3><div class="tblwrap"><table>
-      <thead><tr><th>사원</th><th class="n">건수</th><th class="n">콜량</th><th class="n">콜 시간(분)</th><th class="n">신규 금액</th><th class="n">업셀 금액</th><th class="n">환불 금액</th><th class="n">총합계</th></tr></thead>
-      <tbody>${rows.map(r => `<tr><td>${esc(r.u.name)}</td><td class="n">${r.cnt}</td><td class="n">${won(r.calls)}</td><td class="n">${won(r.time)}</td><td class="n">${won(r.nw)}</td><td class="n">${won(r.up)}</td><td class="n" style="color:var(--red)">${won(r.ref)}</td><td class="n">${won(r.nw + r.up + r.ref)}</td></tr>`).join("")}</tbody></table></div>`;
-  }
+  /* ③ DB 출처별 분배 수 / 실제 결제 수 */
+  const groups = [["실시간", "rt", settings.realtime], ["구 DB", "old", settings.old]];
+  const paid = (uid, status, src) => stx.contracts.filter(c => c.ownerUid === uid && isNew(c) && c.status === status && c.dbSource === src).length;
+  const cols = groups.flatMap(([, pre, list]) => list.map(s => ({ key: `${pre}:${s}`, src: s, status: pre === "rt" ? "실시간" : "구디비" })));
+  const ctot = {}; cols.forEach(c => ctot[c.key] = { sup: 0, paid: 0 });
+  const rowsC = owners.map(o => `<tr><td>${esc(o.name)}</td>${cols.map(c => {
+    const sup = Number((stx.supply.get(o.uid) || {})[c.key]) || 0, pd = paid(o.uid, c.status, c.src);
+    ctot[c.key].sup += sup; ctot[c.key].paid += pd;
+    return `<td class="n"><input type="number" min="0" class="sp" data-u="${esc(o.uid)}" data-k="${esc(c.key)}" value="${sup || ""}" style="width:74px;text-align:right;padding:4px 6px"></td><td class="n">${pd || ""}</td>`;
+  }).join("")}</tr>`).join("");
 
-  $("#view").innerHTML = `<div class="card">${monthBar(`<button class="btn ghost" id="btnSCsv">통계 CSV 저장</button>`)}
-    <div class="tblwrap"><table>
-      <thead><tr><th>날짜</th><th class="n">실시간 수</th><th class="n">구디비 수</th><th class="n">전체 건수</th><th class="n">콜량</th><th class="n">콜 시간(분)</th><th class="n">신규 금액</th><th class="n">업셀 금액</th><th class="n">환불 금액</th><th class="n">총합계</th></tr></thead>
-      <tbody>${body}</tbody>
-      <tfoot><tr><td>합계</td><td class="n">${tot.live}</td><td class="n">${tot.old}</td><td class="n">${tot.all}</td><td class="n">${won(tot.calls)}</td><td class="n">${won(tot.time)}</td><td class="n">${won(tot.nw)}</td><td class="n">${won(tot.up)}</td><td class="n" style="color:var(--red)">${won(tot.ref)}</td><td class="n">${won(tot.nw + tot.up + tot.ref)}</td></tr></tfoot>
-    </table></div>
-    <p class="muted">건수는 '신규' 계약만 셉니다(업셀·환불 제외). 총합계 = 신규 + 업셀 + 환불(음수).</p>${perUser}</div>`;
-  bindMonthBar();
-  $("#btnSCsv").onclick = () => downloadCsv([["날짜", "실시간 수", "구디비 수", "전체 건수", "콜량", "콜 시간(분)", "신규 금액", "업셀 금액", "환불 금액", "총합계"], ...lines], `일별통계_${ym}.csv`);
+  /* ④ 본부 임원 */
+  const exRows = stx.exec.length ? stx.exec : [];
+  const exHtml = exRows.map((r, i) => `<tr data-i="${i}"><td><input class="ex-n" value="${esc(r.name)}" style="min-width:110px"></td>
+    <td class="n"><input class="ex-new" inputmode="numeric" value="${r.newSales ? won(r.newSales) : ""}" style="text-align:right;min-width:120px"></td>
+    <td class="n"><input class="ex-up" inputmode="numeric" value="${r.upsell ? won(r.upsell) : ""}" style="text-align:right;min-width:120px"></td>
+    <td class="n ex-tot">${won((r.newSales || 0) + (r.upsell || 0))}</td>
+    <td class="n"><input class="ex-sup" inputmode="numeric" value="${r.support ? won(r.support) : ""}" style="text-align:right;min-width:120px"></td>
+    <td><button class="btn ghost sm" data-exdel="${i}">삭제</button></td></tr>`).join("");
+
+  $("#view").innerHTML = `<div class="card">
+    <div class="bar"><div><label>조회 월 (입금 날짜 기준)</label><input type="month" id="sYm" value="${ym}"></div>
+      <div><label>날짜별 표에 보일 사원</label><select id="sUid"><option value="">전체 사원</option>${owners.map(o => `<option value="${esc(o.uid)}" ${o.uid === stx.uid ? "selected" : ""}>${esc(o.name)}</option>`).join("")}</select></div>
+      <button class="btn ghost" id="csvA">사원별 CSV</button><button class="btn ghost" id="csvB">날짜별 CSV</button></div>
+    <p class="muted" style="margin-top:0">모든 날짜는 <b>입금 날짜</b> 기준입니다. 신규 건수·신규 매출은 '신규' 계약만, 업셀은 계약 분류 '업셀', 환불은 계약 금액이 음수인 건입니다. 총합계 = 신규 + 업셀 + 환불(음수).</p>
+
+    <h3 style="margin:14px 0 8px">${m}월 영업 사원 데이터 통계</h3>
+    <div class="tblwrap"><table><thead><tr><th>담당자</th><th class="n">DB 총 공급수</th><th class="n">실시간 신규</th><th class="n">구디비 신규</th><th class="n">콜 수</th><th class="n">콜 시간(분)</th><th class="n">신규 매출</th><th class="n">업셀 금액</th><th class="n">환불 금액</th><th class="n">총합계</th></tr></thead>
+      <tbody>${rowsA.map(r => `<tr><td>${esc(r.o.name)}</td><td class="n">${z(r.sup)}</td><td class="n">${r.a.live || ""}</td><td class="n">${r.a.old || ""}</td><td class="n">${z(r.a.calls)}</td><td class="n">${z(r.a.time)}</td><td class="n">${z(r.a.nw)}</td><td class="n">${z(r.a.up)}</td>${red(r.a.ref)}<td class="n">${z(r.a.nw + r.a.up + r.a.ref)}</td></tr>`).join("") || '<tr><td colspan="10" class="muted">데이터가 없습니다.</td></tr>'}</tbody>
+      <tfoot><tr><td>총계</td><td class="n">${won(tot.sup)}</td><td class="n">${tot.live}</td><td class="n">${tot.old}</td><td class="n">${won(tot.calls)}</td><td class="n">${won(tot.time)}</td><td class="n">${won(tot.nw)}</td><td class="n">${won(tot.up)}</td><td class="n" style="color:var(--red)">${won(tot.ref)}</td><td class="n">${won(tot.nw + tot.up + tot.ref)}</td></tr></tfoot></table></div>
+
+    <h3 style="margin:26px 0 8px">${m}월 날짜별 데이터 취합 <span class="muted" style="font-weight:400">· ${sel.size === 1 ? esc(nameOf([...sel][0])) : "전체 사원"}</span></h3>
+    <div class="tblwrap"><table><thead><tr><th>날짜</th><th class="n">실시간 수</th><th class="n">구디비 수</th><th class="n">콜량</th><th class="n">콜시간(분)</th><th class="n">신규 금액</th><th class="n">업셀 금액</th><th class="n">환불 금액</th><th class="n">총합계</th></tr></thead>
+      <tbody>${bodyB}</tbody>
+      <tfoot><tr><td>합계</td><td class="n">${dt.live}</td><td class="n">${dt.old}</td><td class="n">${won(dt.calls)}</td><td class="n">${won(dt.time)}</td><td class="n">${won(dt.nw)}</td><td class="n">${won(dt.up)}</td><td class="n" style="color:var(--red)">${won(dt.ref)}</td><td class="n">${won(dt.nw + dt.up + dt.ref)}</td></tr></tfoot></table></div>
+
+    <h3 style="margin:26px 0 8px">DB 데이터 총 통계 (DB 분배 수 / 실제 결제 수)</h3>
+    <p class="muted" style="margin-top:0">'DB 분배 수'는 직접 입력하는 값입니다(사원별·DB 출처별·월별). '실제 결제 수'는 입력된 신규 계약에서 자동 집계됩니다. DB 출처 목록은 'DB 출처 설정'을 따릅니다.</p>
+    <div class="tblwrap"><table><thead>
+      <tr><th rowspan="3">영업사원명</th>${groups.map(([t, , l]) => `<th class="c" colspan="${l.length * 2}" style="background:#eef2ff">${t}</th>`).join("")}</tr>
+      <tr>${cols.map(c => `<th class="c" colspan="2">${esc(c.src)}</th>`).join("")}</tr>
+      <tr>${cols.map(() => '<th class="n">DB 분배 수</th><th class="n">실제 결제 수</th>').join("")}</tr></thead>
+      <tbody>${rowsC || ""}</tbody>
+      <tfoot><tr><td>합계</td>${cols.map(c => `<td class="n">${z(ctot[c.key].sup)}</td><td class="n">${z(ctot[c.key].paid)}</td>`).join("")}</tr></tfoot></table></div>
+    <div class="actions"><button class="btn" id="supSave">DB 분배 수 저장</button></div>
+
+    <h3 style="margin:26px 0 8px">${m}월 본부 임원 데이터 통계</h3>
+    <div class="tblwrap"><table><thead><tr><th>담당자</th><th class="n">신규 매출</th><th class="n">업셀 금액</th><th class="n">총 금액</th><th class="n">매출지원 금액</th><th></th></tr></thead>
+      <tbody id="exBody">${exHtml || '<tr><td colspan="6" class="muted">등록된 임원이 없습니다.</td></tr>'}</tbody>
+      <tfoot><tr><td>총계</td><td class="n" id="exT1"></td><td class="n" id="exT2"></td><td class="n" id="exT3"></td><td class="n" id="exT4"></td><td></td></tr></tfoot></table></div>
+    <div class="actions"><button class="btn ghost" id="exAdd">+ 임원 추가</button><button class="btn" id="exSave">임원 통계 저장</button></div>
+  </div>`;
+
+  $("#sYm").onchange = async e => { if (!e.target.value) return; ym = e.target.value; await renderStats(); };
+  $("#sUid").onchange = e => { stx.uid = e.target.value; drawStats(); };
+  $("#csvA").onclick = () => downloadCsv(aCsv, `영업사원통계_${ym}.csv`);
+  $("#csvB").onclick = () => downloadCsv(bCsv, `날짜별통계_${ym}.csv`);
+
+  // DB 분배 수 저장
+  $("#supSave").onclick = async () => {
+    const ops = [];
+    owners.forEach(o => {
+      const counts = {};
+      $("#view").querySelectorAll(`input.sp[data-u="${CSS.escape(o.uid)}"]`).forEach(i => { const v = toNum(i.value); if (v) counts[i.dataset.k] = v; });
+      if (!Object.keys(counts).length && !stx.supply.has(o.uid)) return;
+      ops.push(b => b.set(doc(db, "dbSupply", `${ym}_${o.uid}`), { ym, ownerUid: o.uid, counts, updatedAt: serverTimestamp() }));
+    });
+    if (!ops.length) return toast("저장할 내용이 없습니다.");
+    try { await commitOps(ops); toast("DB 분배 수를 저장했습니다."); await renderStats(); }
+    catch (er) { console.error(er); toast("저장 실패: " + (er.code || er.message)); }
+  };
+
+  // 본부 임원
+  const readEx = () => [...$("#exBody").querySelectorAll("tr[data-i]")].map(tr => ({
+    name: tr.querySelector(".ex-n").value.trim(), newSales: toNum(tr.querySelector(".ex-new").value),
+    upsell: toNum(tr.querySelector(".ex-up").value), support: toNum(tr.querySelector(".ex-sup").value)
+  }));
+  const exTotals = () => {
+    const r = readEx();
+    $("#exBody").querySelectorAll("tr[data-i]").forEach((tr, i) => tr.querySelector(".ex-tot").textContent = won(r[i].newSales + r[i].upsell));
+    $("#exT1").textContent = won(sumOf(r, x => x.newSales)); $("#exT2").textContent = won(sumOf(r, x => x.upsell));
+    $("#exT3").textContent = won(sumOf(r, x => x.newSales + x.upsell)); $("#exT4").textContent = won(sumOf(r, x => x.support));
+  };
+  exTotals();
+  $("#exBody").oninput = exTotals;
+  $("#exBody").onclick = e => { const b = e.target.closest("button[data-exdel]"); if (!b) return; stx.exec = readEx(); stx.exec.splice(+b.dataset.exdel, 1); drawStats(); };
+  $("#exAdd").onclick = () => { stx.exec = [...(exRows.length ? readEx() : []), { name: "", newSales: 0, upsell: 0, support: 0 }]; drawStats(); };
+  $("#exSave").onclick = async () => {
+    const rows = readEx().filter(r => r.name);
+    try { await setDoc(doc(db, "execStats", ym), { ym, rows, updatedAt: serverTimestamp() }); stx.exec = rows; toast("임원 통계를 저장했습니다."); drawStats(); }
+    catch (er) { console.error(er); toast("저장 실패: " + (er.code || er.message)); }
+  };
 }
 
 async function commitOps(ops) {
@@ -852,10 +1025,11 @@ function parseSheet(wb, sheetName, refYear) {
     let phone = t("phone"); const dg = digits(phone);
     phone = (dg.length === 10 && dg.startsWith("10")) ? fmtPhone("0" + dg) : fmtPhone(phone);
     const grades = String(g("grade")).split(/[,，/]/).map(x => x.trim()).filter(Boolean);
+    const pp = parsePeriodText(t("period"));
     const base = {
       line: r + 1, name, phone, date: cellDate(g("date"), refYear),
       dbSource: t("dbSource"), status: t("status"), contractType: t("contractType") || "신규",
-      grades, grade: grades.join(", "), amount: toNum(g("amount")), period: t("period"), voucher: t("voucher"),
+      grades, grade: grades.join(", "), amount: toNum(g("amount")), period: pp ? pp.period : t("period"), startDate: pp?.startDate || "", endDate: pp?.endDate || "", endFinal: pp?.endFinal || "", voucher: t("voucher"),
       upsellNote: String(g("upsellNote") ?? "").trim(), note: String(g("note") ?? "").trim(),
       callCount: g("callCount") === "" ? null : toNum(g("callCount")), callTime: g("callTime") === "" ? null : toNum(g("callTime"))
     };
@@ -989,7 +1163,7 @@ function openImport() {
         const data = {
           ownerUid: uid, date: r.finalDate, ym: r.finalDate.slice(0, 7), name: r.name, phone: r.phone, phoneKey: digits(r.phone),
           dbSource: r.dbSource, status: r.status, contractType: r.contractType, grades: r.grades, grade: r.grade,
-          amount: r.amount, period: r.period, voucher: r.voucher, upsellNote: r.upsellNote, note: r.note,
+          amount: r.amount, period: r.period, startDate: r.startDate, endDate: r.endDate, endFinal: r.endFinal, voucher: r.voucher, upsellNote: r.upsellNote, note: r.note,
           createdAt: serverTimestamp(), updatedAt: serverTimestamp()
         };
         ops.push(b => b.set(doc(collection(db, "contracts")), data));
